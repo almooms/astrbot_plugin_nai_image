@@ -233,6 +233,25 @@ IMAGE_SIZES = {
     "4K方图": "4k_square",
 }
 
+# OpenAI 兼容接口下 LLM 工具可选的像素分辨率（对齐接口文档 §12.1 常用尺寸）：
+# 宽高为 64 的倍数、最大边 1920、面积不超过 3686400。OpenAI 兼容模式的尺寸
+# 直接用分辨率表示，不再经由「竖图/2K/4K」等 GET 分档名换算（分档名与真实
+# 分辨率在 4K 档会静默降级，容易对不上）。
+OPENAI_TOOL_SIZES = (
+    "640x640",
+    "832x1216",
+    "1216x832",
+    "1024x1024",
+    "1024x1536",
+    "1536x1024",
+    "1472x1472",
+    "1088x1920",
+    "1920x1088",
+)
+
+# 像素分辨率写法 "1024x1536"（含 ×/* 变体）。
+_PIXEL_SIZE_RE = re.compile(r"^\s*(\d{1,5})\s*[x×*]\s*(\d{1,5})\s*$", re.IGNORECASE)
+
 # OpenAI 兼容接口的模型列表（对齐接口文档 §9）。
 OPENAI_COMPATIBLE_MODELS = [
     "nai-diffusion-5-full",
@@ -565,7 +584,7 @@ def migrate_invalid_call_mode(config: dict) -> str | None:
     "astrbot_plugin_nai_image",
     "缪缪的小水泡",
     "基于 nai.sta1n.cn 的 NovelAI 生图插件",
-    "2.5.1",
+    "2.5.3",
 )
 class NAIGenerateImagePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -756,6 +775,9 @@ class NAIGenerateImagePlugin(Star):
 
         # 读取配置是否启用自主生图工具
         self.enable_llm_tool: bool = bool(config.get("enable_llm_tool", False))
+        # 「开启画风参数」：控制 LLM 生图工具是否向模型暴露 style 参数；
+        # 关闭时工具自动使用「默认风格」设置里选好的画风。
+        self.enable_tool_style: bool = bool(config.get("enable_tool_style", True))
 
         # ==== 陪伴插件直连（extension API）与本地代理开关 ====
         self.enable_companion_link: bool = bool(
@@ -829,6 +851,9 @@ class NAIGenerateImagePlugin(Star):
             f"ref_mode={self.openai_reference_mode} seed={self.openai_seed} "
             f"timeout={self.openai_timeout}s retries={self.openai_max_retries}"
         )
+        # 按加载后的配置刷新 LLM 生图工具的参数 schema（画风开关 / 尺寸格式）。
+        # 工具由装饰器在模块导入时注册，实例化发生在其后，此时改写即时生效。
+        self._refresh_llm_tool_schema()
 
     def _build_full_prompt(
         self,
@@ -3781,8 +3806,30 @@ class NAIGenerateImagePlugin(Star):
         n = args.n if args.n is not None else self.image_count
         style = args.style or self.image_style
         size_cn = args.size or self.image_size
-        # 上游 API 以中文名称区分普通、2K 和 4K 尺寸，必须原样传递。
-        size = size_cn
+        if self.call_mode == "openai":
+            # OpenAI 兼容模式：--size 直接使用像素分辨率（宽x高），契约修正由
+            # _openai_generate 内部完成；分档名则映射为对应分辨率。
+            size = self._openai_size(size_cn) if size_cn in IMAGE_SIZES else size_cn
+        else:
+            # 上游 GET API 以中文名称区分普通、2K 和 4K 尺寸，必须原样传递；
+            # 用户直接给像素分辨率时按长宽比回退到分档名。
+            size = size_cn
+            if size not in IMAGE_SIZES:
+                _px = _PIXEL_SIZE_RE.match(size)
+                if _px:
+                    _w, _h = int(_px.group(1)), int(_px.group(2))
+                    if _w > 0 and _h > 0:
+                        size = (
+                            "方图"
+                            if abs(_w - _h) <= max(_w, _h) * 0.08
+                            else ("竖图" if _h > _w else "横图")
+                        )
+                        logger.info(
+                            f"{LOG_TAG} [cmd:image] 传统 GET 模式不支持像素尺寸，"
+                            f"{size_cn} 已按长宽比映射为 {size}"
+                        )
+                if size not in IMAGE_SIZES:
+                    size = self.image_size
 
         # 回复中展示的参数与 _generate_one 最终采用的覆盖/回退规则保持一致。
         effective_steps = (
@@ -4081,6 +4128,63 @@ class NAIGenerateImagePlugin(Star):
             logger.warning(f"{LOG_TAG} [cmd:interrogate] failed: {exc!r}")
             yield event.plain_result(f"图片反推失败：{type(exc).__name__}: {exc}")
 
+    def _refresh_llm_tool_schema(self) -> None:
+        """按当前插件配置改写 NAI_Generate_Image 的参数 schema。
+
+        注册时由 docstring 生成的 schema 是静态的，插件实例化（含配置热重载）
+        后按设置同步：「开启画风参数」关闭时隐藏 style 字段，生图自动使用设置
+        里的默认画风；size_cn 的说明按调用模式区分——OpenAI 兼容模式直接用像
+        素分辨率（宽x高），传统 GET 模式保持中文分档名。首次调用时把注册生成
+        的原始 properties 缓存在工具对象上，之后每次都从原始 schema 重建，保
+        证开关来回切换时字段可以恢复。
+        """
+        try:
+            manager = self.context.get_llm_tool_manager()
+            tool = manager.get_func("NAI_Generate_Image") if manager else None
+            if tool is None:
+                return
+            params = dict(getattr(tool, "parameters", None) or {})
+            original = getattr(tool, "_nai_original_properties", None)
+            if original is None:
+                original = {
+                    key: dict(value)
+                    for key, value in (params.get("properties") or {}).items()
+                    if isinstance(value, dict)
+                }
+                if not original:
+                    return
+                # pydantic dataclass 允许附加普通属性；缓存注册时的完整字段定义。
+                object.__setattr__(tool, "_nai_original_properties", original)
+            props = {key: dict(value) for key, value in original.items()}
+            # 「开启画风参数」关闭时从 schema 隐藏 style 字段，模型不再传画风，
+            # 生图回退到插件设置的默认画风。
+            if not self.enable_tool_style:
+                props.pop("style", None)
+            if self.call_mode == "openai":
+                default_size = self._openai_size(self.image_size)
+                if "size_cn" in props:
+                    props["size_cn"]["description"] = (
+                        '图片尺寸，像素分辨率 "宽x高"，宽高须为 64 的倍数。'
+                        f"常用值: {', '.join(OPENAI_TOOL_SIZES)}。"
+                        f"留空则使用插件设置的默认尺寸（当前默认 {default_size}）。"
+                    )
+            elif "size_cn" in props:
+                props["size_cn"]["description"] = (
+                    "图片尺寸。可选：竖图 / 横图 / 方图 / 2K竖图 / 2K横图 / "
+                    "2K方图 / 4K竖图 / 4K横图 / 4K方图。"
+                    f"留空则使用插件设置的默认尺寸（当前默认 {self.image_size}）。"
+                )
+            params["properties"] = props
+            params["type"] = "object"
+            tool.parameters = params
+            logger.debug(
+                f"{LOG_TAG} [tool] NAI_Generate_Image schema 已按配置刷新 | "
+                f"style字段={'显示' if self.enable_tool_style else '隐藏'} "
+                f"尺寸格式={'分辨率' if self.call_mode == 'openai' else '分档'}"
+            )
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [tool] 工具参数 schema 刷新失败: {exc!r}")
+
     """
     提供tool让llm可以自主决定生成图片。为了防止暴走，每个消息事件最多请求1张。
     """
@@ -4089,14 +4193,15 @@ class NAIGenerateImagePlugin(Star):
     async def NAI_Generate_Image(
         self,
         event: AstrMessageEvent,
-        prompt: str,
-        style: str,
-        size_cn: str,
+        prompt: str = "",
+        style: str = "",
+        size_cn: str = "",
     ) -> AsyncGenerator[str, None]:
         """用NovelAI生成1张图片并直接发送给当前用户。
 
         每个用户消息最多调用一次本工具。不要在同一响应中重复调用，也不要同时
         调用send_message_to_user；生成成功后本工具会直接发送图片。
+        画风与尺寸留空时，固定使用插件设置里选择的默认画风与默认尺寸。
 
         Args:
             prompt(string): NovelAI 4.5 提示词，标签化格式，标签间用英文逗号隔开。规范：
@@ -4112,8 +4217,8 @@ class NAIGenerateImagePlugin(Star):
                 - 多风格混合：-2::artist collaboration:: 可融合 3 个以上画师风格
                 - 精简：避免堆叠重复/无意义 tags，描述清楚构图即可
                 示例：masterpiece, best quality, {人物 [1girl, solo, long hair, blue eyes, source#hug], {位置左}, ntags = [lowres, bad anatomy] 人物}, {人物 [1boy, short hair, target#hug], {位置右} 人物}, outdoor, sunset, artist:wlop
-            style(string): 画风。可选：vertical(韩漫小清新风) / comicDoujin(漫画同人风) / r18(2.5D唯美风) / lolita25d(2.5D唯美风（萝）) / anime(本子里番风) / galgame(GalGame风) / custom(自定义)
-            size_cn(string): 尺寸。可选：竖图 / 横图 / 方图 / 2K竖图 / 2K横图 / 2K方图 / 4K竖图 / 4K横图 / 4K方图
+            style(string): 画风。可选：vertical(韩漫小清新风) / comicDoujin(漫画同人风) / r18(2.5D唯美风) / lolita25d(2.5D唯美风（萝）) / anime(本子里番风) / galgame(GalGame风) / custom(自定义)。留空使用插件设置的默认画风。
+            size_cn(string): 图片尺寸，留空使用插件设置的默认尺寸。OpenAI 兼容调用模式下为像素分辨率 "宽x高"（如 832x1216，宽高须为 64 的倍数）；传统 GET 模式下为分档名：竖图 / 横图 / 方图 / 2K竖图 / 2K横图 / 2K方图 / 4K竖图 / 4K横图 / 4K方图
         """
         prompt = normalize_prompt(prompt)
         if not self.enable_llm_tool:
@@ -4126,8 +4231,14 @@ class NAIGenerateImagePlugin(Star):
         logger.info(
             f"{LOG_TAG} [tool:NAI_Generate_Image] 调用NAI_Generate_Image, 参数： prompt: {prompt[:100]}, style: {style}, size_cn:{size_cn}"
         )
-        if style == "自定义":
-            style = "custom"
+        raw_style = str(style or "").strip()
+        if raw_style == "自定义":
+            raw_style = "custom"
+        # 「开启画风参数」关闭或未传画风时，固定使用插件设置里选好的默认画风；
+        # 工具 schema 会同步隐藏 style 字段（见 _refresh_llm_tool_schema）。
+        style = (
+            raw_style if (self.enable_tool_style and raw_style) else self.image_style
+        )
         if not prompt:
             logger.info(f"{LOG_TAG} [tool:NAI_Generate_Image] prompt 为空")
             yield "生成失败，提示词不应为空"
@@ -4150,14 +4261,45 @@ class NAIGenerateImagePlugin(Star):
             yield f"未知风格: {style}\n可选: {', '.join(IMAGE_STYLES.keys())}"
             return
 
-        if size_cn not in IMAGE_SIZES:
-            logger.warning(f"{LOG_TAG} [tool:NAI_Generate_Image] 未知尺寸: {size_cn}")
-            yield f"未知尺寸: {size_cn}\n可选: {', '.join(IMAGE_SIZES.keys())}"
-            return
-
-        # 与 /image 命令保持一致：直接使用中文 size_cn 值（竖图/横图/方图/2K竖图/...）发送给 API
-        # 上游（如 nai.sta1n.cn）只识别中文尺寸值，英文别名（portrait/2k_portrait）会导致 2K/4K 生成失败
-        size = size_cn
+        # 尺寸按调用模式归一化：OpenAI 兼容模式直接使用像素分辨率（宽x高），
+        # 不再经由「竖图/2K/4K」分档名换算（4K 档在 OpenAI 接口会被静默降级，
+        # 分档名与真实分辨率对不上）；传统 GET 模式保持中文分档名，上游只识别
+        # 中文尺寸值（portrait/2k_portrait 等英文别名会导致 2K/4K 生成失败）。
+        raw_size = str(size_cn or "").strip()
+        if self.call_mode == "openai":
+            if not raw_size:
+                raw_size = self.image_size
+            if raw_size in IMAGE_SIZES:
+                # 兼容模型沿用分档名：映射为对应分辨率
+                raw_size = self._openai_size(raw_size)
+            if not _PIXEL_SIZE_RE.match(raw_size):
+                logger.warning(
+                    f"{LOG_TAG} [tool:NAI_Generate_Image] 未知尺寸: {size_cn}"
+                )
+                yield (
+                    f"未知尺寸: {size_cn}\n"
+                    f"可选（像素分辨率 宽x高）: {', '.join(OPENAI_TOOL_SIZES)}"
+                )
+                return
+            size = self._normalize_openai_size(raw_size)
+        else:
+            size = normalize_image_size(raw_size) if raw_size else self.image_size
+            if not size and raw_size:
+                # 兼容模型直接给像素分辨率：按长宽比映射到 GET 分档名。
+                match = _PIXEL_SIZE_RE.match(raw_size)
+                if match:
+                    width, height = int(match.group(1)), int(match.group(2))
+                    if width > 0 and height > 0:
+                        if abs(width - height) <= max(width, height) * 0.08:
+                            size = "方图"
+                        else:
+                            size = "竖图" if height > width else "横图"
+            if not size:
+                logger.warning(
+                    f"{LOG_TAG} [tool:NAI_Generate_Image] 未知尺寸: {size_cn}"
+                )
+                yield (f"未知尺寸: {size_cn}\n可选: {', '.join(IMAGE_SIZES.keys())}")
+                return
 
         generation_state = None
         if hasattr(event, "get_extra"):

@@ -199,6 +199,32 @@ def normalize_image_size(value: object) -> str | None:
     return _SIZE_ALIASES.get(normalized)
 
 
+_PIXEL_SIZE_RE = re.compile(r"^\s*(\d{1,5})\s*[x×*]\s*(\d{1,5})\s*$", re.IGNORECASE)
+
+
+def normalize_pixel_size(value: object) -> str | None:
+    """将 ``832x1216`` 之类的像素分辨率写法归一化为 ``宽x高``。
+
+    OpenAI 兼容调用模式直接使用像素分辨率（对齐接口文档 §12.1：宽高为 64 的
+    倍数）；不匹配或小于 64 的写法返回 ``None``，由调用方决定回退或报错。
+
+    Args:
+        value: 任意尺寸字符串输入。
+
+    Returns:
+        归一化后的 ``WxH`` 字符串，非分辨率写法时为 ``None``。
+    """
+
+    match = _PIXEL_SIZE_RE.match(str(value or ""))
+    if not match:
+        return None
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width < 64 or height < 64:
+        return None
+    return f"{width}x{height}"
+
+
 def _read_quoted_value(text: str, start: int, name: str) -> tuple[str, int]:
     """读取带引号的参数值，并返回解码后的值和引号后的下标。
 
@@ -413,8 +439,12 @@ def parse_image_command(
     if "size" in values:
         size = normalize_image_size(values["size"])
         if size is None:
+            # OpenAI 兼容调用模式直接使用像素分辨率（宽x高），允许该写法。
+            size = normalize_pixel_size(values["size"])
+        if size is None:
             raise ImageCommandArgumentError(
-                "参数 --size 无效，例如竖图/portrait、横图/landscape、方图/square。"
+                "参数 --size 无效，例如竖图/portrait、横图/landscape、方图/square，"
+                "或像素分辨率 832x1216。"
             )
 
     sampler = None

@@ -488,6 +488,23 @@
     { value: "4K方图", baseCost: 25 },
   ];
 
+  // OpenAI 兼容格式直接用像素分辨率（接口文档 §12.1），与 GET 分档名一一对应：
+  // 分档名经后端映射后的实际分辨率即为此处的 value。
+  const OPENAI_SIZE_OPTIONS = [
+    { value: "832x1216", tier: "竖图", baseCost: 1 },
+    { value: "1216x832", tier: "横图", baseCost: 1 },
+    { value: "1024x1024", tier: "方图", baseCost: 1 },
+    { value: "1088x1920", tier: "2K竖图", baseCost: 15 },
+    { value: "1920x1088", tier: "2K横图", baseCost: 15 },
+    { value: "1472x1472", tier: "2K方图", baseCost: 15 },
+  ];
+
+  // 分档名 ↔ OpenAI 像素分辨率互查（结果徽标显示用）。
+  function sizeDisplayName(value) {
+    const opt = OPENAI_SIZE_OPTIONS.find((o) => o.value === value);
+    return opt ? `${opt.value}（${opt.tier}）` : value;
+  }
+
   function getModelCostFloor(modelName) {
     return modelName === "nai-diffusion-5-full" ? 5 : 1;
   }
@@ -496,18 +513,30 @@
     const curSize = els.size.value;
     const curModel = els.model.value;
     els.size.innerHTML = "";
-    SIZE_BASE_COSTS.forEach((opt) => {
+    const options =
+      currentCallFormat === "openai"
+        ? OPENAI_SIZE_OPTIONS.map((opt) => ({
+            value: opt.value,
+            text: opt.value,
+            baseCost: opt.baseCost,
+          }))
+        : SIZE_BASE_COSTS.map((opt) => ({
+            value: opt.value,
+            text: opt.value,
+            baseCost: opt.baseCost,
+          }));
+    options.forEach((opt) => {
       const cost = Math.max(opt.baseCost, getModelCostFloor(curModel));
       const elOpt = document.createElement("option");
       elOpt.value = opt.value;
-      elOpt.textContent = `${opt.value}(-${cost})`;
+      elOpt.textContent = `${opt.text}(-${cost})`;
       if (opt.value === curSize) {
         elOpt.selected = true;
       }
       els.size.appendChild(elOpt);
     });
-    if (!SIZE_BASE_COSTS.some((opt) => opt.value === curSize)) {
-      els.size.value = "竖图";
+    if (!options.some((opt) => opt.value === curSize)) {
+      els.size.value = currentCallFormat === "openai" ? "832x1216" : "竖图";
     }
   }
 
@@ -1051,13 +1080,8 @@
       galgame: "GalGame风",
       custom: "自定义",
     };
-    const sizeNames = {
-      "竖图": "竖图", "横图": "横图", "方图": "方图",
-      "2K竖图": "2K竖图", "2K横图": "2K横图", "2K方图": "2K方图",
-      "4K竖图": "4K竖图", "4K横图": "4K横图", "4K方图": "4K方图"
-    };
     const formatLabel = requestBody.call_format === "openai" ? "OpenAI" : "NAI直连";
-    const metaText = `${styleNames[requestBody.style] || requestBody.style} · ${sizeNames[requestBody.size] || requestBody.size} · ${images.length} UNIT · ${formatLabel}`;
+    const metaText = `${styleNames[requestBody.style] || requestBody.style} · ${sizeDisplayName(requestBody.size)} · ${images.length} UNIT · ${formatLabel}`;
     setBadge(els.resultMeta, metaText, "badge-tech-success");
     show(els.resultMeta);
 
@@ -1203,6 +1227,7 @@
     }
     applyRefModeUI();
     updateModelOptionsUI();
+    updateSizeOptionsUI();
   }
 
   function handleReferenceFileChange() {

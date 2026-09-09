@@ -38,8 +38,24 @@ def make_plugin(generate_result):
     plugin = object.__new__(NAIGenerateImagePlugin)
     plugin.call_mode = "direct"
     plugin.enable_llm_tool = True
+    plugin.enable_tool_style = True
     plugin.image_gen_key = "test-token"
+    plugin.image_style = "vertical"
+    plugin.image_size = "竖图"
     plugin._generate_one = AsyncMock(return_value=generate_result)
+    return plugin
+
+
+def make_openai_plugin(generate_result):
+    plugin = make_plugin(generate_result)
+    plugin.call_mode = "openai"
+    plugin.openai_api_base_url = "https://openai.example"
+    plugin.openai_api_key = "sk-test"
+    plugin.custom_artists = ""
+    img_bytes, reason = generate_result
+    plugin._openai_generate = AsyncMock(
+        return_value=([img_bytes] if img_bytes else [], reason)
+    )
     return plugin
 
 
@@ -142,6 +158,136 @@ def test_llm_tool_passes_supported_sizes_to_api_unchanged():
 
         assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
         plugin._generate_one.assert_awaited_once_with("1girl", "anime", size_cn)
+
+
+def test_llm_tool_openai_mode_uses_pixel_resolution():
+    plugin = make_openai_plugin((b"test-image-bytes", "ok"))
+    event = FakeEvent()
+
+    results = asyncio.run(
+        collect_results(plugin.NAI_Generate_Image(event, "1girl", "anime", "1024x1536"))
+    )
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    args, _ = plugin._openai_generate.await_args
+    assert args[1] == "1024x1536"
+
+
+def test_llm_tool_openai_mode_maps_tier_names_to_resolution():
+    plugin = make_openai_plugin((b"test-image-bytes", "ok"))
+    event = FakeEvent()
+
+    results = asyncio.run(
+        collect_results(plugin.NAI_Generate_Image(event, "1girl", "anime", "4K竖图"))
+    )
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    args, _ = plugin._openai_generate.await_args
+    # 4K 档在 OpenAI 接口被降级为 2K 上限分辨率（与 _openai_size 契约一致）
+    assert args[1] == "1088x1920"
+
+
+def test_llm_tool_openai_mode_rejects_invalid_size():
+    plugin = make_openai_plugin((b"test-image-bytes", "ok"))
+    event = FakeEvent()
+
+    results = asyncio.run(
+        collect_results(
+            plugin.NAI_Generate_Image(event, "1girl", "anime", "not-a-size")
+        )
+    )
+
+    assert len(results) == 1
+    assert "未知尺寸" in results[0]
+    assert "832x1216" in results[0]
+    plugin._openai_generate.assert_not_awaited()
+
+
+def test_llm_tool_direct_mode_maps_pixel_size_to_tier():
+    plugin = make_plugin((b"test-image-bytes", "ok"))
+    event = FakeEvent()
+
+    results = asyncio.run(
+        collect_results(plugin.NAI_Generate_Image(event, "1girl", "anime", "1024x1536"))
+    )
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "竖图")
+
+
+def test_llm_tool_defaults_style_and_size_from_plugin_config():
+    plugin = make_plugin((b"test-image-bytes", "ok"))
+    plugin.image_style = "galgame"
+    plugin.image_size = "2K横图"
+    event = FakeEvent()
+
+    results = asyncio.run(collect_results(plugin.NAI_Generate_Image(event, "1girl")))
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    plugin._generate_one.assert_awaited_once_with("1girl", "galgame", "2K横图")
+
+
+def test_llm_tool_style_disabled_forces_plugin_default_style():
+    plugin = make_plugin((b"test-image-bytes", "ok"))
+    plugin.enable_tool_style = False
+    plugin.image_style = "galgame"
+    event = FakeEvent()
+
+    # 即使模型仍然传来 style，开关关闭时也必须使用插件设置的默认画风
+    results = asyncio.run(
+        collect_results(plugin.NAI_Generate_Image(event, "1girl", "anime", "方图"))
+    )
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    plugin._generate_one.assert_awaited_once_with("1girl", "galgame", "方图")
+
+
+def test_refresh_llm_tool_schema_hides_style_and_switches_size_format():
+    plugin = make_plugin((b"test-image-bytes", "ok"))
+    registered = {
+        "prompt": {"type": "string", "description": "提示词"},
+        "style": {"type": "string", "description": "画风"},
+        "size_cn": {"type": "string", "description": "尺寸"},
+    }
+
+    class FakeTool:
+        def __init__(self):
+            self.parameters = {"type": "object", "properties": dict(registered)}
+
+    class FakeManager:
+        def __init__(self):
+            self.tool = FakeTool()
+
+        def get_func(self, name):
+            return self.tool if name == "NAI_Generate_Image" else None
+
+    class FakeContext:
+        def __init__(self):
+            self.manager = FakeManager()
+
+        def get_llm_tool_manager(self):
+            return self.manager
+
+    plugin.context = FakeContext()
+    tool = plugin.context.get_llm_tool_manager().tool
+
+    # 关闭画风参数 + OpenAI 模式：style 隐藏，size 描述改为像素分辨率
+    plugin.enable_tool_style = False
+    plugin.call_mode = "openai"
+    plugin.image_size = "竖图"
+    plugin._refresh_llm_tool_schema()
+    props = tool.parameters["properties"]
+    assert "style" not in props
+    assert "宽x高" in props["size_cn"]["description"]
+
+    # 重新开启 + 切回 direct：从原始 schema 重建，style 恢复，size 描述回到分档名
+    plugin.enable_tool_style = True
+    plugin.call_mode = "direct"
+    plugin._refresh_llm_tool_schema()
+    props = tool.parameters["properties"]
+    assert "style" in props
+    assert props["style"]["description"] == "画风"
+    assert "竖图" in props["size_cn"]["description"]
 
 
 def test_llm_tool_allows_only_one_generation_attempt_per_event():

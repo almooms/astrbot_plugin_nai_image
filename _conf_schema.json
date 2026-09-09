@@ -405,6 +405,15 @@
         "description": "启用 LLM 生图工具",
         "hint": "关闭后 LLM agent 无法调用此工具；开启后允许 LLM 自主决定生图时机（每次限 1 张）。"
     },
+    "enable_tool_style": {
+        "type": "bool",
+        "default": true,
+        "description": "开启画风参数",
+        "hint": "控制 LLM 生图工具 NAI_Generate_Image 是否允许模型自行指定画风。开启时模型可传入画风（不传则使用「默认风格」设置）；关闭时工具不再向模型暴露画风参数，生图自动使用「默认风格」设置里选好的画风。",
+        "condition": {
+            "enable_llm_tool": true
+        }
+    },
     "enable_companion_link": {
         "type": "bool",
         "default": true,
