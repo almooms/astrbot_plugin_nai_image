@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import mcp
 
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Image
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
@@ -131,9 +131,9 @@ def test_llm_tool_sends_image_and_returns_one_text_result():
     assert results[0] == "图片已生成并发送给用户，请根据本次请求继续回复。"
     assert len(event.sent_messages) == 1
     assert isinstance(event.sent_messages[0], MessageChain)
-    assert isinstance(event.sent_messages[0].chain[0], Plain)
-    assert isinstance(event.sent_messages[0].chain[1], Image)
-    assert event.sent_messages[0].chain[1].file.startswith("base64://")
+    assert isinstance(event.sent_messages[0].chain[0], Image)
+    assert len(event.sent_messages[0].chain) == 1
+    assert event.sent_messages[0].chain[0].file.startswith("base64://")
     plugin._generate_one.assert_awaited_once_with("1girl", "anime", "方图")
 
 
