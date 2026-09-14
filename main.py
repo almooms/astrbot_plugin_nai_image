@@ -4343,9 +4343,7 @@ class NAIGenerateImagePlugin(Star):
             logger.info(
                 f"{LOG_TAG} [tool:NAI_Generate_Image] 图片发送 | bytes={len(img_bytes)}"
             )
-            await event.send(
-                MessageChain(chain=[Plain("[图片已生成]"), Img.fromBytes(img_bytes)])
-            )
+            await event.send(MessageChain(chain=[Img.fromBytes(img_bytes)]))
             logger.info(f"{LOG_TAG} [tool:NAI_Generate_Image] 完成 | 成功")
             yield "图片已生成并发送给用户，请根据本次请求继续回复。"
             return
