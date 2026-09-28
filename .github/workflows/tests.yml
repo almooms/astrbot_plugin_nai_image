@@ -20,7 +20,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install astrbot pytest
+        # Pin astrbot >= 4.28.2: without a floor, pip can silently backtrack to an
+        # ancient astrbot (e.g. 4.11.4) on some Python versions, whose missing
+        # astrbot.api.web module breaks the test suite at import time.
+        run: pip install "astrbot>=4.28.2" pytest
 
       - name: Run tests
         run: python -m pytest tests/ -v
