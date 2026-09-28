@@ -338,6 +338,7 @@
                 <div class="input-wrap">
                   <input id="steps" type="number" class="input acrylic-input" min="1" max="100" value="24" />
                 </div>
+                <div id="costBadge" class="cost-badge hidden">点数预估</div>
               </div>
 
               <!-- Scale -->
@@ -602,9 +603,51 @@
           </div>
         </div>
       </section>
+
+      <!-- 底部：点数用量统计（按日期聚合，柱状图 + 趋势线） -->
+      <section class="usage-section">
+        <div class="card tactical-card usage-card acrylic-card">
+          <div class="card-header usage-card-header acrylic-header">
+            <div class="card-num-box">
+              <span class="card-number">05</span>
+              <span class="card-sec-tag">USAG</span>
+            </div>
+            <div class="card-title-group">
+              <h2 class="card-title">点数用量台账 // USAGE LEDGER</h2>
+              <span class="card-sub-code">COST_PER_DAY</span>
+            </div>
+            <div class="usage-header-actions">
+              <div class="usage-range-switch" id="usageRangeSwitch">
+                <button type="button" class="usage-range-btn is-active" data-days="7">7D</button>
+                <button type="button" class="usage-range-btn" data-days="30">30D</button>
+                <button type="button" class="usage-range-btn" data-days="90">90D</button>
+              </div>
+              <button id="usageRefreshBtn" type="button" class="btn-secondary tactical-btn btn-sm">
+                <span class="btn-icon-symbol">↻</span>
+                <span>REFRESH</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="card-body usage-body acrylic-inner">
+            <div id="usageSummary" class="usage-summary"></div>
+            <div id="usageChartWrap" class="usage-chart-wrap">
+              <div id="usageChart" class="usage-chart"></div>
+            </div>
+            <div id="usageBreakdown" class="usage-breakdown"></div>
+            <div id="usageEmpty" class="usage-empty hidden">
+              暂无消耗记录 —— 成功生图后会按上游档位表自动累计点数。
+            </div>
+            <div id="usageDisabled" class="usage-empty hidden">
+              点数用量统计已关闭，可在插件设置中开启「点数用量统计」。
+            </div>
+            <div id="usageError" class="usage-empty hidden"></div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
-  <script src="./app.js?v=4.7.0"></script>
+  <script src="./app.js?v=4.8.1"></script>
 </body>
 </html>

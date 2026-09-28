@@ -214,6 +214,9 @@ def test_generate_one_uses_overrides_in_request_and_history():
         return_value=("1girl, solo", "none", False, "nai")
     )
     plugin._archive_generated_image = AsyncMock()
+    # 路由固定任务接口优先：本测试验证 GET 回退路径的请求字段，
+    # mock 任务接口返回 404 不可用，使其落到 GET 直链。
+    plugin._submit_web_job = AsyncMock(return_value=(None, "web_jobs_unavailable"))
 
     result = asyncio.run(
         plugin._generate_one(
@@ -267,6 +270,9 @@ def test_generate_one_uses_overrides_in_request_and_history():
         "negative": "bad anatomy, blurry",
         "nocache": 1,
         "noise_schedule": "exponential",
+        # 直连通道与本次点数（点数用量统计据此累计）
+        "transport": "get",
+        "estimated_cost": 1,
     }
 
 
@@ -312,6 +318,8 @@ def test_generate_one_allows_empty_custom_artist_without_fallback():
         return_value=("1girl, solo", "none", False, "nai")
     )
     plugin._archive_generated_image = AsyncMock()
+    # 同上：mock 任务接口不可用，验证 GET 回退路径。
+    plugin._submit_web_job = AsyncMock(return_value=(None, "web_jobs_unavailable"))
 
     result = asyncio.run(
         plugin._generate_one(

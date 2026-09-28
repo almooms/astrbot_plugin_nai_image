@@ -1601,6 +1601,204 @@ body::before {
   padding: 3px 9px;
 }
 
+/* ===== 点数预估徽标（步数 × 画质实时计价） ===== */
+.cost-badge {
+  margin-top: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  background: rgba(220, 221, 214, 0.6);
+  border: 1px solid rgba(110, 114, 107, 0.32);
+  color: var(--edge-ink-secondary);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.cost-badge.cost-badge-high {
+  background: var(--edge-amber-soft);
+  border-color: rgba(217, 130, 43, 0.55);
+  color: var(--edge-amber);
+}
+
+/* ===== 点数用量台账（05 卡片） ===== */
+.usage-section {
+  grid-column: 1 / -1;
+  margin-top: 14px;
+}
+
+.usage-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-range-switch {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: var(--radius-full);
+  background: var(--edge-soft);
+  border: 1px solid var(--edge-ink-subtle);
+}
+
+.usage-range-btn {
+  border: none;
+  background: transparent;
+  color: var(--edge-ink-muted);
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+
+.usage-range-btn:hover {
+  color: var(--edge-ink-primary);
+}
+
+.usage-range-btn.is-active {
+  background: var(--edge-panel-solid);
+  color: var(--edge-ink-primary);
+  box-shadow: 0 1px 4px rgba(16, 17, 16, 0.12);
+}
+
+.usage-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.usage-stat {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--edge-soft);
+  border: 1px solid var(--edge-ink-subtle);
+}
+
+.usage-stat-label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  color: var(--edge-ink-muted);
+  margin-bottom: 3px;
+}
+
+.usage-stat-value {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--edge-ink-primary);
+  line-height: 1.2;
+}
+
+.usage-stat-value .usage-unit {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--edge-ink-muted);
+  margin-left: 2px;
+}
+
+.usage-stat-sub {
+  display: block;
+  font-size: 10px;
+  color: var(--edge-ink-muted);
+  margin-top: 2px;
+}
+
+.usage-chart-wrap {
+  padding: 6px 2px 2px;
+  overflow-x: auto;
+}
+
+.usage-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-width: 320px;
+}
+
+.usage-bar {
+  fill: rgba(20, 208, 208, 0.5);
+  stroke: var(--edge-cyan);
+  stroke-width: 1;
+  transition: fill 0.15s ease;
+}
+
+.usage-bar:hover {
+  fill: rgba(20, 208, 208, 0.85);
+}
+
+.usage-line {
+  fill: none;
+  stroke: var(--edge-amber);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.usage-grid-line {
+  stroke: var(--edge-ink-subtle);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+
+.usage-axis-text {
+  fill: var(--edge-ink-muted);
+  font-size: 9px;
+  letter-spacing: 0.3px;
+}
+
+.usage-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.usage-bd-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.usage-bd-tag {
+  flex: 0 0 auto;
+  min-width: 40px;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  background: var(--edge-soft);
+  border: 1px solid var(--edge-ink-subtle);
+  color: var(--edge-ink-secondary);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+}
+
+.usage-bd-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--edge-ink-secondary);
+}
+
+.usage-bd-item {
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: rgba(20, 208, 208, 0.14);
+  border: 1px solid rgba(20, 208, 208, 0.34);
+}
+
+.usage-empty {
+  padding: 14px;
+  border-radius: var(--radius-sm);
+  background: var(--edge-soft);
+  border: 1px dashed var(--edge-ink-subtle);
+  color: var(--edge-ink-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
 /* ===== 工具类 ===== */
 .hidden {
   display: none !important;

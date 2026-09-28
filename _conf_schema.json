@@ -32,6 +32,21 @@
             "call_mode": "direct"
         }
     },
+    "show_cost_estimate": {
+        "type": "bool",
+        "default": true,
+        "description": "显示预计消耗点数",
+        "hint": "开启后 /image 回复与测试面板会实时显示本次生图的预计点数消耗（按步数×画质档位估算）。关闭则不再显示。用 /price 可单独试算并查询实时余额。",
+        "condition": {
+            "call_mode": "direct"
+        }
+    },
+    "enable_usage_stats": {
+        "type": "bool",
+        "default": true,
+        "description": "点数用量统计",
+        "hint": "开启后每次成功出图会按日期累计点数消耗，可用 /usage 指令查询，并在测试面板以柱状图/趋势线查看（7/30/90 日）。关闭后不再记录，历史数据保留。"
+    },
     "openai_api_base_url": {
         "type": "string",
         "default": "",
@@ -73,7 +88,7 @@
         "type": "string",
         "default": "nai-diffusion-4-5-full",
         "description": "生图模型",
-        "hint": "选择生成模型。nai-diffusion-4-5-full 为 V4.5 完整版（标准尺寸单张消耗 1 点）；nai-diffusion-5-full 为 V5 完整版（标准尺寸如竖图单张消耗 5 点，2K/4K 分别消耗 15/25 点）。",
+        "hint": "选择生成模型。步数 1-28 时：nai-diffusion-4-5-full（V4.5 完整版）标准画幅单张 1 点；nai-diffusion-5-full（V5 完整版）标准画幅单张 8 点。2K 一律 15 点、4K 一律 25 点（与模型无关）。步数 29 起走任务接口并按档位加价，详见 README 价目表。",
         "options": [
             "nai-diffusion-4-5-full",
             "nai-diffusion-5-full"
@@ -90,7 +105,7 @@
         "type": "string",
         "default": "竖图",
         "description": "默认尺寸",
-        "hint": "选择生成图片的尺寸和分辨率。消耗额度：V4.5模型基础尺寸(竖/横/方图)消耗1点，2K消耗15点，4K消耗25点；V5模型最低消耗5点(竖/横/方图消耗5点，2K消耗15点，4K消耗25点)。",
+        "hint": "选择生成图片的尺寸和分辨率。基础计价：普通画幅（竖/横/方图）V4.5 1 点、V5 8 点；2K 一律 15 点；4K 一律 25 点。步数 29 起另按档位加价（29-35 +4，36-45 +6，46-50 +8）。",
         "options": [
             "竖图",
             "横图",
@@ -145,27 +160,27 @@
         "type": "int",
         "default": 24,
         "description": "采样步数",
-        "hint": "OpenAI 兼容模式按接口文档限制在 1-50，超出部分自动收敛。"
+        "hint": "直连模式经任务接口支持 1-50 步（29 步起按档位加价，46-50 步单价最高）；OpenAI 兼容模式同样限 1-50，超出自动收敛。"
     },
     "scale": {
         "type": "int",
         "default": 6,
         "description": "scale",
-        "hint": "提示词引导强度。OpenAI 兼容模式按接口文档限制在 0-10，超出部分自动收敛。"
+        "hint": "提示词引导强度。直连模式限 1-20，OpenAI 兼容模式限 0-10，超出自动收敛。"
     },
     "cfg": {
         "type": "float",
-        "default": 7.0,
+        "default": 1.0,
         "description": "CFG Rescale",
-        "hint": "对应接口参数 cfg，默认 7，范围 0-30，支持小数和 0 值。",
+        "hint": "CFG 重缩放系数，上游有效范围 0-1（超出会被上游钳制，旧版设置页标注的 0-30 为错误说明）。0 关闭重缩放，1 最强。",
         "min": 0,
-        "max": 30
+        "max": 1
     },
     "sampler": {
         "type": "string",
         "default": "k_dpmpp_2m_sde",
         "description": "采样器",
-        "hint": "ddim 仅适用于 nai-diffusion-3 模型。",
+        "hint": "不确定时保持默认 k_dpmpp_2m_sde 即可；ddim 仅适用于 nai-diffusion-3 模型（本插件仅支持 V4.5/V5）。",
         "options": [
             "k_dpmpp_2m_sde",
             "k_dpmpp_2m",
@@ -174,18 +189,6 @@
             "k_euler_ancestral",
             "k_euler",
             "ddim"
-        ]
-    },
-    "noise_schedule": {
-        "type": "string",
-        "default": "karras",
-        "description": "噪声调度",
-        "hint": "native 仅适用于 nai-diffusion-3 模型。",
-        "options": [
-            "karras",
-            "exponential",
-            "polyexponential",
-            "native"
         ]
     },
     "negative": {
@@ -198,7 +201,7 @@
         "type": "string",
         "default": "vibe",
         "description": "参考图使用模式",
-        "hint": "支持一次提交多张参考图（最多 8 张，面板可逐图设置强度）。vibe：参考图走 generations 的 reference_image_multiple 做风格/角色参考（§5）；img2img：仅取第一张图走 /v1/images/edits 做图生图重绘（§4）；director：精准参考，走 generations 的 director_reference_* 参数（§6，支持 nai-diffusion-4-5 与 nai-diffusion-5 系列）。本地代理的 edits 端点始终按 img2img 处理。",
+        "hint": "决定聊天/陪伴发来的参考图如何使用（最多 8 张，面板可逐图设强度）。Vibe 参考：把参考图作为风格/角色氛围参考，适合「照着这张的感觉画」；img2img：以第一张参考图为底图重绘，适合「在这张图基础上改」；精准参考：从参考图精确提取角色/画风信息（仅 V4.5/V5 系列模型），适合「保持这个角色不变」。",
         "options": [
             "vibe",
             "img2img",
@@ -390,14 +393,20 @@
         "type": "bool",
         "default": false,
         "description": "保存生图参数",
-        "hint": "配合「保存生图历史」使用。开启后为每张图片保存同名 YAML 文档，记录实际生图参数；不会保存 Token，提示词换行会在生图前转为逗号。"
+        "hint": "配合「保存生图历史」使用。开启后为每张图片保存同名 YAML 文档，记录实际生图参数；不会保存 Token，提示词换行会在生图前转为逗号。",
+        "condition": {
+            "save_image_history": true
+        }
     },
     "image_history_limit": {
         "type": "int",
         "default": 0,
         "description": "历史保留数量",
         "hint": "仅在保存生图历史时生效。每次保存后自动删除最旧图片及其同名参数文档，仅保留指定数量；设为 0 不清理。",
-        "min": 0
+        "min": 0,
+        "condition": {
+            "save_image_history": true
+        }
     },
     "enable_llm_tool": {
         "type": "bool",
@@ -431,7 +440,10 @@
         "options": [
             "自然语言模式（en）",
             "nai tag模式"
-        ]
+        ],
+        "condition": {
+            "enable_companion_link": true
+        }
     },
     "companion_image_retention_days": {
         "type": "int",
@@ -439,7 +451,10 @@
         "description": "陪伴直连图片保留天数",
         "hint": "陪伴直连生成的图片保存在 plugin_data/astrbot_plugin_nai_image/companion_images，按天清理超期文件；设为 0 不按时间清理。",
         "min": 0,
-        "max": 3650
+        "max": 3650,
+        "condition": {
+            "enable_companion_link": true
+        }
     },
     "enable_proxy": {
         "type": "bool",
@@ -458,13 +473,13 @@
         "min": 1024,
         "max": 65535,
         "condition": {
-            "enable_companion_link": false
+            "enable_proxy": true
         }
     },
     "bypass_system_proxy": {
         "type": "bool",
         "default": true,
         "description": "绕过系统代理直连生图站",
-        "hint": "默认开启：插件请求 nai.sta1n.cn 时忽略系统代理与环境变量代理，强制直连，避免开梯子时被代理出口拦截导致连不上生图站。若你的网络必须走代理才能访问生图站，请关闭本开关。注意：对 Clash 等 TUN 虚拟网卡模式的梯子，本开关无法绕过，请在梯子软件里为 nai.sta1n.cn 添加直连（DIRECT）规则。"
+        "hint": "默认开启：请求 nai.sta1n.cn 时强制直连，避免梯子拦截。仅在必须走代理才能访问生图站时关闭；Clash 等 TUN 模式请在梯子内为 nai.sta1n.cn 加 DIRECT 规则。"
     }
 }

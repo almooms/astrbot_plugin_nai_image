@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import mimetypes
 import re
 import shutil
@@ -30,6 +31,23 @@ if __package__:
         strip_image_command_prefix,
     )
     from .companion_api import NAIImageCompanionExtensionAPI
+    from .pricing import (
+        DIRECT_URL_STEPS_MAX,
+        TRANSPORT_GET,
+        TRANSPORT_WEB_JOBS,
+        WEB_JOB_STEPS_MAX,
+        direct_url_generation_cost,
+        effective_steps as effective_transport_steps,
+        estimate_openai_cost,
+        price_table_lines,
+        web_job_generation_cost,
+    )
+    from .usage_stats import (
+        STATS_FILE_NAME,
+        UsageStatsStore,
+        format_usage_report,
+        sparkline,
+    )
     from .prompt_processing import (
         TRANSLATE_MODE_AUTO,
         TRANSLATE_MODE_OFF,
@@ -46,6 +64,23 @@ else:
         normalize_image_style,
         parse_image_command,
         strip_image_command_prefix,
+    )
+    from pricing import (
+        DIRECT_URL_STEPS_MAX,
+        TRANSPORT_GET,
+        TRANSPORT_WEB_JOBS,
+        WEB_JOB_STEPS_MAX,
+        direct_url_generation_cost,
+        effective_steps as effective_transport_steps,
+        estimate_openai_cost,
+        price_table_lines,
+        web_job_generation_cost,
+    )
+    from usage_stats import (
+        STATS_FILE_NAME,
+        UsageStatsStore,
+        format_usage_report,
+        sparkline,
     )
     from prompt_processing import (
         TRANSLATE_MODE_AUTO,
@@ -300,6 +335,14 @@ OPENAI_DIRECTOR_CAPTIONS = ("character", "style", "character&style")
 OPENAI_RETRYABLE_STATUS = {408, 429, 502, 503, 504}
 OPENAI_RETRY_DELAYS = (2.0, 4.0, 8.0)
 
+# 任务接口（POST /api/web/jobs）轮询参数：提交/单次轮询/总等待的秒数上限。
+# 总等待与 GET 直链生图共用 180s 上限；上游 /generate 60s 必回，任务接口
+# 排队 + 4K 生成可能更久，但超过 180s 仍按超时处理（上游失败会退点）。
+WEB_JOB_SUBMIT_TIMEOUT = 30
+WEB_JOB_POLL_INTERVAL = 2.0
+WEB_JOB_POLL_REQUEST_TIMEOUT = 15
+WEB_JOB_TOTAL_TIMEOUT = 180
+
 # 中转网关会把 NovelAI 上游的瞬时故障（如 vibe 编码"服务繁忙"）包装成
 # HTTP 400（type=bad_response_status_code），错误文案本身提示"请稍后重试"；
 # 错误信息命中下列任一关键词时，即便状态码不可重试也按可重试处理。
@@ -375,6 +418,51 @@ DEFAULT_NEGATIVE = (
 )
 
 
+def _summarize_error_body(body: str) -> str:
+    """从上游错误正文提取一句话摘要（优先 JSON 的 error/message 字段）。"""
+
+    body = (body or "").strip()
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            for key in ("error", "message"):
+                value = data.get(key)
+                if value:
+                    return str(value)[:200].replace("\n", " ").strip()
+    except (ValueError, TypeError):
+        pass
+    return body[:200].replace("\n", " ").strip()
+
+
+def _empty_usage_payload(enabled: bool, days: int) -> dict[str, Any]:
+    """统计不可用（数据目录不可达 / 尚未初始化）时的空快照。"""
+
+    empty_row = {"date": "", "cost": 0, "count": 0, "failed": 0}
+    empty_totals = {
+        "days_in_window": 0,
+        "active_days": 0,
+        "cost": 0,
+        "count": 0,
+        "failed": 0,
+        "avg_cost": 0.0,
+        "peak_cost": 0,
+        "peak_date": "",
+    }
+    return {
+        "enabled": enabled,
+        "days": days,
+        "today": empty_row,
+        "window": dict(empty_totals),
+        "overall": dict(empty_totals),
+        "series": [],
+        "breakdown": {"model": [], "size": [], "transport": []},
+        "first_day": "",
+        "is_empty": True,
+    }
+
+
 def _format_generate_error(reason: str) -> str:
     """把生图方法返回的 reason 翻译成给用户的中文报错。"""
     _map = {
@@ -383,6 +471,10 @@ def _format_generate_error(reason: str) -> str:
         "openai_not_configured": (
             "❌ 未配置 OpenAI 兼容生图接口地址（openai_api_base_url），"
             "请先在插件设置中填写。"
+        ),
+        "web_job_failed": (
+            "🚫 上游生成任务失败（失败任务的点数会自动退回），"
+            "请查看日志或稍后重试。"
         ),
         "timeout": "⏱ 生图超时。上游可能仍在生成（可能已扣费），请稍后手动重试；若频繁超时可在设置中调大「请求超时」。",
         "empty_response": "📭 上游返回 200 但内容为空，可能是接口限流或临时异常。",
@@ -584,7 +676,7 @@ def migrate_invalid_call_mode(config: dict) -> str | None:
     "astrbot_plugin_nai_image",
     "缪缪的小水泡",
     "基于 nai.sta1n.cn 的 NovelAI 生图插件",
-    "2.5.3",
+    "2.7.2",
 )
 class NAIGenerateImagePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -637,11 +729,16 @@ class NAIGenerateImagePlugin(Star):
         try:
             cfg = config.get("cfg")
             # CFG 的 0 是有效值，不能用 `config.get("cfg") or 默认值` 读取。
-            self.cfg_value: float = float(cfg) if cfg is not None and cfg != "" else 7.0
+            # 上游 providers.js 将 cfg 钳制在 0-1（旧配置里的 7.0 会被钳到 1.0），
+            # 这里同步钳制，使面板显示值与实际生效值一致。
+            raw_cfg = float(cfg) if cfg is not None and cfg != "" else 1.0
+            self.cfg_value: float = max(0.0, min(raw_cfg, 1.0))
         except (TypeError, ValueError):
-            self.cfg_value = 7.0
+            self.cfg_value = 1.0
         self.sampler: str = config.get("sampler") or "k_dpmpp_2m_sde"
-        self.noise_schedule: str = config.get("noise_schedule") or "karras"
+        # 噪声调度固定 karras（v2.7.2 起移除该配置项）：直连仅支持
+        # V4.5/V5，karras 为通用推荐值；--noise 指令参数仍可临时覆盖。
+        self.noise_schedule: str = "karras"
         neg = config.get("negative")
         self.negative: str = neg if neg else DEFAULT_NEGATIVE
         self.enable_template: bool = bool(config.get("enable_template", True))
@@ -653,6 +750,12 @@ class NAIGenerateImagePlugin(Star):
         self.call_mode: str = (config.get("call_mode") or "direct").strip()
         if self.call_mode not in ("direct", "openai"):
             self.call_mode = "direct"
+        # 聊天回复与测试面板是否展示「预计消耗点数」。
+        self.show_cost_estimate: bool = bool(config.get("show_cost_estimate", True))
+        # 点数用量统计：按日期累计每次成功出图的点数，供 /usage 与面板图表读取。
+        self.enable_usage_stats: bool = bool(config.get("enable_usage_stats", True))
+        self._usage_stats_lock = asyncio.Lock()
+        self._usage_stats: UsageStatsStore | None = None
         # OpenAI 兼容格式（可配置的第三方 OpenAI 兼容生图站点）
         self.openai_api_base_url: str = (
             (config.get("openai_api_base_url") or "").strip().rstrip("/")
@@ -1087,6 +1190,117 @@ class NAIGenerateImagePlugin(Star):
         except Exception as e:
             logger.warning(f"{LOG_TAG} [history] 保存或清理失败，不影响本次出图: {e!r}")
 
+    def _usage_stats_store(self) -> UsageStatsStore | None:
+        """返回用量统计仓库；插件数据目录不可用时返回 ``None``。
+
+        仓库在首次调用时创建（数据目录要等插件实例化后才能解析），创建失败
+        只记日志，绝不影响生图主流程。
+        """
+
+        # 用 getattr 读取：单测直接 object.__new__ 构造对象时没有该属性。
+        if getattr(self, "_usage_stats", None) is None:
+            try:
+                self._usage_stats = UsageStatsStore(
+                    self._get_plugin_data_dir() / STATS_FILE_NAME
+                )
+            except Exception as e:
+                logger.warning(f"{LOG_TAG} [usage] 数据目录不可用，跳过统计: {e!r}")
+                return None
+        return self._usage_stats
+
+    async def _record_usage_stat(
+        self,
+        cost: int,
+        *,
+        count: int = 1,
+        failed: int = 0,
+        transport: str = "",
+        model: str = "",
+        size: str = "",
+        day: str | None = None,
+    ) -> None:
+        """累计一次生图结果的点数消耗，失败不影响出图流程。
+
+        点数按 :mod:`pricing` 的档位表估算；``failed`` 只记次数不记点数
+        （上游任务失败会退点）。``day`` 可显式指定归档日期（默认今天）。
+        读写在线程中完成并由实例锁串行化。
+        """
+
+        if not getattr(self, "enable_usage_stats", True):
+            return
+        # 仓库未就绪（插件尚未完成初始化）时直接跳过，绝不因此写脏数据目录。
+        if self._usage_stats_store() is None:
+            return
+        try:
+            async with self._usage_stats_lock:
+                store = self._usage_stats_store()
+                await asyncio.to_thread(store.load)
+                store.record(
+                    cost,
+                    count=count,
+                    failed=failed,
+                    transport=transport,
+                    model=model,
+                    size=size,
+                    day=day,
+                )
+                await asyncio.to_thread(store.save)
+        except Exception as e:
+            logger.warning(f"{LOG_TAG} [usage] 累计用量失败，不影响本次出图: {e!r}")
+
+    async def _record_usage_from_parameters(
+        self, generation_parameters: dict[str, Any]
+    ) -> None:
+        """按归档参数里的 ``estimated_cost`` / ``transport`` 累计一次用量。"""
+
+        await self._record_usage_stat(
+            int(generation_parameters.get("estimated_cost") or 0),
+            transport=str(generation_parameters.get("transport") or ""),
+            model=str(generation_parameters.get("model") or ""),
+            size=str(generation_parameters.get("size") or ""),
+        )
+
+    async def _usage_stats_payload(self, days: int = 30) -> dict[str, Any]:
+        """构造用量统计快照（聊天指令与面板图表共用）。"""
+
+        try:
+            async with self._usage_stats_lock:
+                store = self._usage_stats_store()
+                if store is None:
+                    return _empty_usage_payload(
+                        bool(getattr(self, "enable_usage_stats", True)), days
+                    )
+                await asyncio.to_thread(store.load)
+                window = store.totals(days)
+                overall = store.totals(0)
+                series = store.series(days)
+                today_rows = store.series(1)
+                return {
+                    "enabled": bool(getattr(self, "enable_usage_stats", True)),
+                    "days": days,
+                    "today": today_rows[-1] if today_rows else {
+                        "date": "",
+                        "cost": 0,
+                        "count": 0,
+                        "failed": 0,
+                    },
+                    "window": window,
+                    "overall": overall,
+                    "series": series,
+                    "breakdown": {
+                        field: [
+                            {"name": name, "cost": value}
+                            for name, value in store.breakdown(days, field)
+                        ]
+                        for field in ("model", "size", "transport")
+                    },
+                    "first_day": store.first_day(),
+                    "is_empty": store.is_empty(),
+                }
+        except Exception as e:
+            logger.warning(f"{LOG_TAG} [usage] 读取用量统计失败: {e!r}")
+            return {"enabled": False, "days": days, "error": repr(e)}
+
     async def initialize(self):
         logger.info(f"{LOG_TAG} [initialize] 阶段开始")
         # 1) 启动时迁移旧版误写到 data/<plugin_name> 的运行数据。
@@ -1190,6 +1404,12 @@ class NAIGenerateImagePlugin(Star):
                 ["GET"],
                 "NAI 测试面板：加载面板缓存",
             )
+            self.context.register_web_api(
+                f"{PAGE_API_PREFIX}/usage",
+                self._test_panel_usage,
+                ["GET"],
+                "NAI 测试面板：点数用量统计（按日期）",
+            )
             logger.info(
                 f"{LOG_TAG} [initialize] 测试面板 Web API 已注册 | prefix={PAGE_API_PREFIX}"
             )
@@ -1198,6 +1418,15 @@ class NAIGenerateImagePlugin(Star):
 
         # 5) 试用生成：解密代码内混淆密钥 + 加载本地试用次数
         await self._init_trial_feature()
+
+        # 6) 载入点数用量统计（损坏文件会自动备份并重置）
+        try:
+            store = self._usage_stats_store()
+            if store is not None:
+                async with self._usage_stats_lock:
+                    await asyncio.to_thread(store.load)
+        except Exception as e:
+            logger.warning(f"{LOG_TAG} [initialize] 载入用量统计失败: {e!r}")
 
         logger.info(
             f"{LOG_TAG} [initialize] 阶段完成 | token={'OK' if self.image_gen_key else 'MISSING'} | "
@@ -2023,6 +2252,16 @@ class NAIGenerateImagePlugin(Star):
                         f"{LOG_TAG} [openai_generate] 下载 url 失败: {type(exc).__name__}"
                     )
         if images:
+            # OpenAI 兼容端点的实际计费由中转站决定，这里按像素画幅推断档位，
+            # 仅作为用量统计的估算值（与直连档位表口径不同，分开记录）。
+            _openai_size = str(payload.get("size") or size or "")
+            await self._record_usage_stat(
+                estimate_openai_cost(_openai_size, model) * len(images),
+                count=len(images),
+                transport="openai",
+                model=str(model or ""),
+                size=_openai_size,
+            )
             return images, "ok"
         return [], "empty_response"
 
@@ -2110,6 +2349,53 @@ class NAIGenerateImagePlugin(Star):
             f"prompt='{full_prompt[:60]}...'"
         )
 
+        generation_parameters = {
+            "tag": full_prompt,
+            "model": _model,
+            "artist": _artists,
+            "size": size,
+            "steps": _steps,
+            "scale": _scale,
+            "cfg": _cfg,
+            "sampler": _sampler,
+            "negative": _negative,
+            "nocache": 1,
+            "noise_schedule": _noise,
+        }
+
+        # 与 _generate_one 保持一致：任务接口优先（1-50 步、档位计价、
+        # 失败退点），上游不支持时自动回退 GET 直链。
+        web_img, web_reason = await self._submit_web_job(
+            full_prompt,
+            _artists,
+            size,
+            steps=_steps,
+            scale=_scale,
+            cfg=_cfg,
+            sampler=_sampler,
+            noise_schedule=_noise,
+            negative=_negative,
+            model=_model,
+            token=_token,
+        )
+        if web_img is not None:
+            generation_parameters["steps"] = effective_transport_steps(
+                _steps, TRANSPORT_WEB_JOBS
+            )
+            generation_parameters["transport"] = "web_jobs"
+            generation_parameters["estimated_cost"] = web_job_generation_cost(
+                size, _model, _steps
+            )
+            await self._archive_generated_image(web_img, generation_parameters)
+            await self._record_usage_from_parameters(generation_parameters)
+            return web_img, "ok"
+        if web_reason != "web_jobs_unavailable":
+            return None, web_reason
+        logger.warning(
+            f"{LOG_TAG} [generate:custom] 上游不支持任务接口，回退 GET 直链 | "
+            f">{DIRECT_URL_STEPS_MAX} 步将按 {DIRECT_URL_STEPS_MAX} 步路由"
+        )
+
         url = (
             f"{self.base_url.rstrip('/')}/generate"
             f"?tag={quote(full_prompt)}"
@@ -2125,19 +2411,6 @@ class NAIGenerateImagePlugin(Star):
             f"&nocache=1"
             f"&noise_schedule={_noise}"
         )
-        generation_parameters = {
-            "tag": full_prompt,
-            "model": _model,
-            "artist": _artists,
-            "size": size,
-            "steps": _steps,
-            "scale": _scale,
-            "cfg": _cfg,
-            "sampler": _sampler,
-            "negative": _negative,
-            "nocache": 1,
-            "noise_schedule": _noise,
-        }
         # 脱敏日志：不输出明文 token
         safe_url = url.replace(f"&token={_token}", "&token=***")
         logger.debug(f"{LOG_TAG} [generate:custom] request url = {safe_url}")
@@ -2184,10 +2457,15 @@ class NAIGenerateImagePlugin(Star):
                     f"{LOG_TAG} [generate:custom] 成功 | size={size} "
                     f"png={_w}x{_h} bytes={len(img_bytes)}"
                 )
+                generation_parameters["transport"] = TRANSPORT_GET
+                generation_parameters["estimated_cost"] = direct_url_generation_cost(
+                    size, _model
+                )
                 await self._archive_generated_image(
                     img_bytes,
                     generation_parameters,
                 )
+                await self._record_usage_from_parameters(generation_parameters)
                 return img_bytes, "ok"
         except asyncio.TimeoutError:
             return None, "timeout"
@@ -2428,12 +2706,51 @@ class NAIGenerateImagePlugin(Star):
             logger.warning(f"{LOG_TAG} [panel_cache] 加载失败: {e!r}")
             return json_response({"status": "ok", "data": None})
 
+    async def _test_panel_usage(self) -> Any:
+        """Web API: 点数用量统计（7/30/90 日窗口 + 90 日逐日序列）。
+
+        前端按选中的窗口切片渲染柱状图/折线图，无需后端再接受查询参数。
+        """
+
+        windows: dict[str, Any] = {}
+        breakdowns: dict[str, Any] = {}
+        series: list[dict[str, Any]] = []
+        overall: dict[str, Any] = {}
+        today: dict[str, Any] = {}
+        first_day = ""
+        enabled = True
+        for days in (7, 30, 90):
+            payload = await self._usage_stats_payload(days)
+            enabled = bool(payload.get("enabled", True))
+            windows[str(days)] = payload.get("window", {})
+            breakdowns[str(days)] = payload.get("breakdown", {})
+            if days == 90:
+                series = payload.get("series", [])
+                overall = payload.get("overall", {})
+                today = payload.get("today", {})
+                first_day = payload.get("first_day", "")
+        return json_response(
+            {
+                "status": "ok",
+                "data": {
+                    "enabled": enabled,
+                    "first_day": first_day,
+                    "today": today,
+                    "overall": overall,
+                    "windows": windows,
+                    "breakdowns": breakdowns,
+                    "series": series,
+                },
+            }
+        )
+
     async def _test_panel_get_config(self) -> Any:
         """Web API: 返回当前插件配置（脱敏 token）。"""
         return json_response(
             {
                 "image_gen_key": "已配置" if self.image_gen_key else "未配置",
                 "base_url": self.base_url,
+                "show_cost_estimate": self.show_cost_estimate,
                 "image_style": self.image_style,
                 "image_size": self.image_size,
                 "image_count": self.image_count,
@@ -3158,6 +3475,216 @@ class NAIGenerateImagePlugin(Star):
         )
         return prepared_prompt, outfit_source, use_default_outfit, prompt_kind
 
+    async def _submit_web_job(
+        self,
+        full_prompt: str,
+        artists: str,
+        size: str,
+        *,
+        steps: int,
+        scale: float,
+        cfg: float,
+        sampler: str,
+        noise_schedule: str,
+        negative: str,
+        model: str,
+        token: str | None = None,
+    ) -> tuple[bytes | None, str]:
+        """经任务接口（POST /api/web/jobs）提交生图并轮询取回图片。
+
+        上游 2026-09 计费模块：任务接口支持 1-50 步，按「步数 × 画质」
+        档位计价，失败任务点数自动退回；GET 直链最高按 28 步路由且固定
+        基础档价格。token 经 POST body 与轮询请求头（x-user-token）传递，
+        不出现在 URL 中。
+
+        Returns:
+            (img_bytes_or_None, reason)
+            reason 额外取值:
+            "web_jobs_unavailable"（上游无任务接口，调用方可回退 GET 直链）、
+            "web_job_failed"（任务失败，点数已退回）。
+        """
+        _token = token or self.image_gen_key
+        if not _token:
+            return None, "no_token"
+        if not self._session:
+            return None, "no_session"
+
+        base = self.base_url.rstrip("/")
+        # 步数钳制到任务接口上限 50，与上游 clamp 行为一致。
+        _steps = max(1, min(int(steps), WEB_JOB_STEPS_MAX))
+        payload = {
+            "token": _token,
+            "tag": full_prompt,
+            "artist": artists or "",
+            "model": model,
+            "size": size,
+            "steps": _steps,
+            "scale": scale,
+            "cfg": cfg,
+            "sampler": sampler,
+            "negative": negative,
+            "noise_schedule": noise_schedule,
+            "nocache": 1,
+        }
+        estimated_cost = web_job_generation_cost(size, model, _steps)
+        logger.info(
+            f"{LOG_TAG} [web_job] 提交任务 | size={size} steps={_steps} "
+            f"model={model} 预计消耗={estimated_cost} 点"
+        )
+        try:
+            async with self._session.post(
+                f"{base}/api/web/jobs",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=WEB_JOB_SUBMIT_TIMEOUT),
+            ) as resp:
+                if resp.status == 404:
+                    logger.info(
+                        f"{LOG_TAG} [web_job] 上游无任务接口（404），"
+                        f"调用方将回退 GET 直链"
+                    )
+                    return None, "web_jobs_unavailable"
+                if resp.status not in (200, 202):
+                    err_body = ""
+                    try:
+                        err_body = await resp.text()
+                    except Exception:
+                        pass
+                    summary = _summarize_error_body(err_body)
+                    logger.warning(
+                        f"{LOG_TAG} [web_job] 提交失败 | status={resp.status} "
+                        f"body='{err_body[:300]}'"
+                    )
+                    if 400 <= resp.status < 500:
+                        reason = f"http_4xx (HTTP {resp.status})"
+                    elif 500 <= resp.status < 600:
+                        reason = f"http_5xx (HTTP {resp.status})"
+                    else:
+                        reason = f"http_other (HTTP {resp.status})"
+                    if summary:
+                        reason = f"{reason}: {summary}"
+                    return None, reason
+                try:
+                    job = await resp.json()
+                except Exception:
+                    logger.warning(f"{LOG_TAG} [web_job] 提交响应不是 JSON")
+                    return None, "invalid_response"
+        except asyncio.TimeoutError:
+            logger.warning(f"{LOG_TAG} [web_job] 提交超时 (>{WEB_JOB_SUBMIT_TIMEOUT}s)")
+            return None, "timeout"
+        except Exception as e:
+            logger.warning(f"{LOG_TAG} [web_job] 提交异常: {e!r}")
+            return None, "exception"
+
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            logger.warning(f"{LOG_TAG} [web_job] 提交响应缺少任务 id: {job!r}")
+            return None, "invalid_response"
+        actual_cost = job.get("cost")
+        logger.info(
+            f"{LOG_TAG} [web_job] 任务已入队 | id={job_id} status={job.get('status')} "
+            f"cost={actual_cost if actual_cost is not None else estimated_cost}"
+        )
+
+        # 轮询直到 done / failed / 超时；单次轮询失败容忍 3 次再判异常。
+        poll_failures = 0
+        deadline = time.perf_counter() + WEB_JOB_TOTAL_TIMEOUT
+        while True:
+            job = None
+            try:
+                async with self._session.get(
+                    f"{base}/api/jobs/{job_id}",
+                    headers={"x-user-token": _token},
+                    timeout=aiohttp.ClientTimeout(
+                        total=WEB_JOB_POLL_REQUEST_TIMEOUT
+                    ),
+                ) as resp:
+                    if resp.status == 200:
+                        job = await resp.json()
+                    else:
+                        logger.warning(
+                            f"{LOG_TAG} [web_job] 轮询非 200 | id={job_id} "
+                            f"status={resp.status}"
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"{LOG_TAG} [web_job] 轮询异常 | id={job_id} err={e!r}"
+                )
+            if job is not None:
+                poll_failures = 0
+                status = str(job.get("status") or "")
+                if status == "done":
+                    image_url = str(job.get("imageUrl") or "")
+                    if not image_url:
+                        logger.warning(
+                            f"{LOG_TAG} [web_job] 任务完成但无 imageUrl: {job!r}"
+                        )
+                        return None, "invalid_response"
+                    return await self._download_web_job_image(base, image_url)
+                if status == "failed":
+                    error_text = str(job.get("error") or "上游未返回原因")
+                    logger.warning(
+                        f"{LOG_TAG} [web_job] 任务失败 | id={job_id} "
+                        f"error='{error_text}'（点数会自动退回）"
+                    )
+                    return None, "web_job_failed"
+            else:
+                poll_failures += 1
+                if poll_failures >= 3:
+                    logger.warning(
+                        f"{LOG_TAG} [web_job] 连续 {poll_failures} 次轮询失败，"
+                        f"放弃任务 | id={job_id}"
+                    )
+                    return None, "exception"
+            if time.perf_counter() >= deadline:
+                logger.warning(
+                    f"{LOG_TAG} [web_job] 轮询超时 (>{WEB_JOB_TOTAL_TIMEOUT}s) | "
+                    f"id={job_id}"
+                )
+                return None, "timeout"
+            await asyncio.sleep(WEB_JOB_POLL_INTERVAL)
+
+    async def _download_web_job_image(
+        self, base: str, image_url: str
+    ) -> tuple[bytes | None, str]:
+        """下载任务接口返回的图片（imageUrl 为相对路径时拼上 base）。"""
+
+        if image_url.startswith(("http://", "https://")):
+            url = image_url
+        else:
+            url = f"{base}{'/' + image_url.lstrip('/') if not image_url.startswith('/') else image_url}"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=60)
+            ) as resp:
+                # 上游用 x-error:1 标记错误占位图，避免把错误图当成功归档。
+                if resp.headers.get("x-error") == "1":
+                    logger.warning(f"{LOG_TAG} [web_job] 图片下载收到错误占位图")
+                    return None, "web_job_failed"
+                if resp.status != 200:
+                    logger.warning(
+                        f"{LOG_TAG} [web_job] 图片下载失败 | status={resp.status}"
+                    )
+                    if 400 <= resp.status < 500:
+                        return None, f"http_4xx (HTTP {resp.status})"
+                    if 500 <= resp.status < 600:
+                        return None, f"http_5xx (HTTP {resp.status})"
+                    return None, f"http_other (HTTP {resp.status})"
+                img_bytes = await resp.read()
+                if not img_bytes:
+                    logger.warning(f"{LOG_TAG} [web_job] 图片下载空响应")
+                    return None, "empty_response"
+                logger.info(
+                    f"{LOG_TAG} [web_job] 图片下载成功 | bytes={len(img_bytes)}"
+                )
+                return img_bytes, "ok"
+        except asyncio.TimeoutError:
+            logger.warning(f"{LOG_TAG} [web_job] 图片下载超时")
+            return None, "timeout"
+        except Exception as e:
+            logger.warning(f"{LOG_TAG} [web_job] 图片下载异常: {e!r}")
+            return None, "exception"
+
     async def _generate_one(
         self,
         prompt: str,
@@ -3185,7 +3712,12 @@ class NAIGenerateImagePlugin(Star):
             (img_bytes_or_None, reason)
             reason 取值: "ok" / "no_token" / "no_session" /
                         "timeout" / "http_4xx" / "http_5xx" / "http_other" /
-                        "empty_response" / "exception"
+                        "empty_response" / "invalid_response" /
+                        "web_job_failed" / "exception"
+
+        生图通道固定为任务接口优先（1-50 步，按步数档位计价，失败退点），
+        上游无任务接口（404，旧版自建 Nai2API）时自动回退 GET 直链
+        （>28 步按 28 路由，基础档计价）。
         """
         if not self.image_gen_key:
             logger.warning(f"{LOG_TAG} [generate] 跳过：token 未配置")
@@ -3262,6 +3794,55 @@ class NAIGenerateImagePlugin(Star):
         logger.debug(f"{LOG_TAG} [generate] full_prompt(完整) = {full_prompt!r}")
         logger.debug(f"{LOG_TAG} [generate] artists = {artists!r}")
 
+        # 历史文件记录最终发往接口的字段，不保存 token 等认证信息。
+        generation_parameters = {
+            "tag": full_prompt,
+            "model": _model,
+            "artist": artists,
+            "size": size,
+            "steps": _steps,
+            "scale": _scale,
+            "cfg": _cfg,
+            "sampler": _sampler,
+            "negative": _negative,
+            "nocache": 1,
+            "noise_schedule": _noise,
+        }
+
+        # 直连通道固定为任务接口（/api/web/jobs）优先：支持 1-50 步、
+        # 按「步数 × 画质」档位计价、失败退点；上游无该接口（404，自建
+        # 旧版 Nai2API）时自动回退 GET 直链（>28 步按 28 路由、基础档计价）。
+        web_img, web_reason = await self._submit_web_job(
+            full_prompt,
+            artists,
+            size,
+            steps=_steps,
+            scale=_scale,
+            cfg=_cfg,
+            sampler=_sampler,
+            noise_schedule=_noise,
+            negative=_negative,
+            model=_model,
+        )
+        if web_img is not None:
+            generation_parameters["steps"] = effective_transport_steps(
+                _steps, TRANSPORT_WEB_JOBS
+            )
+            generation_parameters["transport"] = "web_jobs"
+            generation_parameters["estimated_cost"] = web_job_generation_cost(
+                size, _model, _steps
+            )
+            await self._archive_generated_image(web_img, generation_parameters)
+            await self._record_usage_from_parameters(generation_parameters)
+            return web_img, "ok"
+        if web_reason != "web_jobs_unavailable":
+            return None, web_reason
+        logger.warning(
+            f"{LOG_TAG} [generate] 上游不支持任务接口，回退 GET 直链 | "
+            f">{DIRECT_URL_STEPS_MAX} 步将按 {DIRECT_URL_STEPS_MAX} 步路由、"
+            f"按基础档计价"
+        )
+
         url = (
             f"{self.base_url.rstrip('/')}/generate"
             f"?tag={quote(full_prompt)}"
@@ -3277,20 +3858,6 @@ class NAIGenerateImagePlugin(Star):
             f"&nocache=1"
             f"&noise_schedule={quote(_noise)}"
         )
-        # 历史文件记录最终发往接口的字段，不保存 token 等认证信息。
-        generation_parameters = {
-            "tag": full_prompt,
-            "model": _model,
-            "artist": artists,
-            "size": size,
-            "steps": _steps,
-            "scale": _scale,
-            "cfg": _cfg,
-            "sampler": _sampler,
-            "negative": _negative,
-            "nocache": 1,
-            "noise_schedule": _noise,
-        }
         # 脱敏：日志中不输出完整 URL（含明文 token）
         safe_url = url.replace(f"&token={self.image_gen_key}", "&token=***")
         logger.debug(f"{LOG_TAG} [generate] request url = {safe_url}")
@@ -3324,10 +3891,15 @@ class NAIGenerateImagePlugin(Star):
                     f"{LOG_TAG} [generate] 成功 | bytes={len(img_bytes)} "
                     f"elapsed={elapsed:.2f}s style={style} size={size}"
                 )
+                generation_parameters["transport"] = TRANSPORT_GET
+                generation_parameters["estimated_cost"] = direct_url_generation_cost(
+                    size, _model
+                )
                 await self._archive_generated_image(
                     img_bytes,
                     generation_parameters,
                 )
+                await self._record_usage_from_parameters(generation_parameters)
                 return img_bytes, "ok"
         except asyncio.TimeoutError:
             logger.warning(
@@ -3738,6 +4310,32 @@ class NAIGenerateImagePlugin(Star):
         )
 
     @filter.command("image")
+    def _resolve_direct_size(self, size_cn: str) -> str:
+        """传统 GET 模式的尺寸归一化：必须产出上游识别的中文分档名。
+
+        像素分辨率（如 ``832x1216``）在该通道不支持，按长宽比回退为分档名；
+        无法识别时回退插件默认尺寸。
+        """
+
+        size = size_cn
+        if size not in IMAGE_SIZES:
+            _px = _PIXEL_SIZE_RE.match(size)
+            if _px:
+                _w, _h = int(_px.group(1)), int(_px.group(2))
+                if _w > 0 and _h > 0:
+                    size = (
+                        "方图"
+                        if abs(_w - _h) <= max(_w, _h) * 0.08
+                        else ("竖图" if _h > _w else "横图")
+                    )
+                    logger.info(
+                        f"{LOG_TAG} [cmd] 传统 GET 模式不支持像素尺寸，"
+                        f"{size_cn} 已按长宽比映射为 {size}"
+                    )
+            if size not in IMAGE_SIZES:
+                size = self.image_size
+        return size
+
     async def image(self, event: AstrMessageEvent):
         """处理 `/image` 指令，并将命名参数作为本次生图的临时覆盖值。
 
@@ -3761,6 +4359,9 @@ class NAIGenerateImagePlugin(Star):
                 "覆盖: --translate=关闭|开启|自动 --template=关闭|开启 "
                 '--model=... --artist="..." --negative="..."\n'
                 '多角色(仅OpenAI兼容): --char="提示词|x|y"（可重复，坐标0-1）\n'
+                "价格试算: /price [--steps=40 --size=2K竖图 --model=...] "
+                "（不生图，按步数×画质档位试算并实时查余额）\n"
+                "用量统计: /usage [天数|today|all]（按日期统计点数消耗）\n"
                 "style/size/translate/template 的值均支持中英文。"
             )
             return
@@ -3811,25 +4412,9 @@ class NAIGenerateImagePlugin(Star):
             # _openai_generate 内部完成；分档名则映射为对应分辨率。
             size = self._openai_size(size_cn) if size_cn in IMAGE_SIZES else size_cn
         else:
-            # 上游 GET API 以中文名称区分普通、2K 和 4K 尺寸，必须原样传递；
-            # 用户直接给像素分辨率时按长宽比回退到分档名。
-            size = size_cn
-            if size not in IMAGE_SIZES:
-                _px = _PIXEL_SIZE_RE.match(size)
-                if _px:
-                    _w, _h = int(_px.group(1)), int(_px.group(2))
-                    if _w > 0 and _h > 0:
-                        size = (
-                            "方图"
-                            if abs(_w - _h) <= max(_w, _h) * 0.08
-                            else ("竖图" if _h > _w else "横图")
-                        )
-                        logger.info(
-                            f"{LOG_TAG} [cmd:image] 传统 GET 模式不支持像素尺寸，"
-                            f"{size_cn} 已按长宽比映射为 {size}"
-                        )
-                if size not in IMAGE_SIZES:
-                    size = self.image_size
+            # 传统 GET 模式：上游 GET API 以中文名称区分普通、2K 和 4K 尺寸，
+            # 必须原样传递；用户直接给像素分辨率时按长宽比回退到分档名。
+            size = self._resolve_direct_size(size_cn)
 
         # 回复中展示的参数与 _generate_one 最终采用的覆盖/回退规则保持一致。
         effective_steps = (
@@ -3839,7 +4424,7 @@ class NAIGenerateImagePlugin(Star):
             args.scale if args.scale is not None else getattr(self, "scale", 6)
         )
         effective_cfg = (
-            args.cfg if args.cfg is not None else getattr(self, "cfg_value", 7.0)
+            args.cfg if args.cfg is not None else getattr(self, "cfg_value", 1.0)
         )
         effective_sampler = args.sampler or getattr(self, "sampler", "k_dpmpp_2m_sde")
         effective_noise = args.noise_schedule or getattr(
@@ -3857,6 +4442,17 @@ class NAIGenerateImagePlugin(Star):
         # 只传递用户明确指定的字段，避免 None 覆盖插件级默认配置。
         generation_overrides = args.generation_overrides()
 
+        # 直连模式按「步数 × 画质」档位预估点数（任务接口计费见 pricing
+        # 模块）；步数超过任务接口上限 50 时按 50 计。
+        cost_note = ""
+        if self.call_mode != "openai" and getattr(self, "show_cost_estimate", True):
+            unit_cost = web_job_generation_cost(
+                size, effective_model, effective_steps
+            )
+            cost_note = f"\n预计消耗: {unit_cost} 点/张"
+            if n > 1:
+                cost_note += f"（{n} 张共 {unit_cost * n} 点）"
+
         logger.info(
             f"{LOG_TAG} [cmd:image] 最终参数 | style={style} size_cn={size_cn} "
             f"size={size} n={n} steps={effective_steps} scale={effective_scale} "
@@ -3872,6 +4468,7 @@ class NAIGenerateImagePlugin(Star):
             f"采样器: {effective_sampler}，噪声: {effective_noise}，"
             f"转译: {effective_translate}，模板: "
             f"{'开启' if effective_template else '关闭'}"
+            f"{cost_note}"
         )
         # “仅图片”只省略成功前的状态文字，后续失败原因始终会正常回复。
         if self.bot_reply_mode == "完整":
@@ -4373,6 +4970,154 @@ class NAIGenerateImagePlugin(Star):
         if not result.get("enabled", True):
             lines.append("⚠️ 该 token 已被站点停用（enabled=false），生图可能失败")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("price", alias={"价格", "点数"})
+    async def price(self, event: AstrMessageEvent):
+        """试算传统 GET 直连的点数消耗，并实时查询余额。
+
+        不带参数时按插件默认配置试算；带 ``--steps``/``--size``/``--model``
+        等参数时按指定值试算（参数与 /image 完全一致，但不会真的生图）。
+        传统 GET 直连按「步数 × 画质」档位计价，>28 步需走任务接口。
+        """
+        sender = event.get_sender_id() if hasattr(event, "get_sender_id") else "?"
+        logger.info(f"{LOG_TAG} [cmd:price] 收到指令 | sender={sender}")
+
+        # 指令名剥离：与 /image 一样，AstrBot 不会改写 event.message_str。
+        raw = str(event.message_str or "").strip()
+        text = raw
+        for prefix in ("price", "/price"):
+            if raw == prefix:
+                text = ""
+                break
+            if raw.startswith(prefix) and raw[len(prefix)].isspace():
+                text = raw[len(prefix) :].lstrip()
+                break
+
+        try:
+            args = parse_image_command(text, default_style=self.image_style)
+        except ImageCommandArgumentError as e:
+            logger.info(f"{LOG_TAG} [cmd:price] 参数错误: {e}")
+            yield event.plain_result(f"参数错误：{e}")
+            return
+
+        if self.call_mode == "openai":
+            yield event.plain_result(
+                "当前调用模式为「OpenAI 兼容」，点数规则由该服务方决定，"
+                "本价目表仅适用于「传统 GET」直连模式（nai.sta1n.cn）。\n"
+                "可在插件设置中把调用模式切回「传统 GET」后再次查询。"
+            )
+            return
+
+        size_cn = args.size or self.image_size
+        size = self._resolve_direct_size(size_cn)
+        steps = args.steps if args.steps is not None else self.steps
+        model = args.model or self.model
+        n = args.n if args.n is not None else self.image_count
+
+        unit_cost = web_job_generation_cost(size, model, steps)
+        routed_steps = effective_transport_steps(steps, TRANSPORT_WEB_JOBS)
+
+        lines = [
+            "💰 点数控算（传统 GET 直连）",
+            f"当前参数: {size} · {routed_steps} 步 · {model}",
+            "生图通道: 任务接口 /api/web/jobs（支持 1-50 步、档位计价、失败退点）\n"
+            "  上游无任务接口（旧版自建）时自动回退 GET 直链（≤28 步、基础档计价）",
+            f"预计消耗: {unit_cost} 点/张（{n} 张共 {unit_cost * n} 点）",
+        ]
+        if steps != routed_steps:
+            lines.append(f"⚠️ 步数 {steps} 超过通道上限，实际按 {routed_steps} 步生成并计价")
+        # 实时余额：与 /quota 同源，失败不影响试算结果展示。
+        if self.image_gen_key:
+            quota = await self._fetch_quota()
+            if quota.get("ok"):
+                balance_line = f"实时余额: {quota['value']} 点"
+                if not quota.get("enabled", True):
+                    balance_line += "（⚠️ 该 token 已被站点停用）"
+                lines.append(balance_line)
+                if quota["value"] < unit_cost * n:
+                    lines.append("⚠️ 余额不足以完成本次生成，请先充值或减少张数。")
+            else:
+                lines.append(f"实时余额: 查询失败（{quota.get('message', '未知原因')}）")
+        else:
+            lines.append("实时余额: 未配置 image_gen_key，跳过查询")
+
+        lines.append("")
+        lines.append("价目表（点/张，步数 × 画质）:")
+        lines.extend(price_table_lines())
+        lines.append(
+            "说明: ≤28 步按基础档（V4.5 标准 1 点 / V5 标准 8 点 / 2K 15 点 / 4K 25 点）；"
+            "29 步起走任务接口并加价（29-35 +4，36-45 +6，46-50 +8）。"
+            "GET 直链最高按 28 步路由，不给超 28 步加价。"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("usage", alias={"用量", "统计", "点数用量"})
+    async def usage(self, event: AstrMessageEvent):
+        """查询本插件的点数消耗统计（按日期聚合）。
+
+        用法: ``/usage``（默认近 7 日）/ ``/usage 30`` / ``/usage all``
+        / ``/usage today``。点数按上游档位表估算，OpenAI 兼容模式按像素
+        画幅推断档位，属估算值。
+        """
+        sender = event.get_sender_id() if hasattr(event, "get_sender_id") else "?"
+        logger.info(f"{LOG_TAG} [cmd:usage] 收到指令 | sender={sender}")
+
+        if not getattr(self, "enable_usage_stats", True):
+            yield event.plain_result(
+                "点数用量统计已关闭，可在插件设置中开启「点数用量统计」后使用。"
+            )
+            return
+
+        raw = str(event.message_str or "").strip()
+        text = raw
+        for prefix in ("usage", "/usage", "用量", "/用量", "统计", "/统计"):
+            if raw == prefix:
+                text = ""
+                break
+            if raw.startswith(prefix) and len(raw) > len(prefix) and raw[len(prefix)].isspace():
+                text = raw[len(prefix) :].lstrip()
+                break
+
+        days = 7
+        token = text.strip().casefold()
+        if token in ("", "7", "7d", "week", "周"):
+            days = 7
+        elif token in ("today", "今日", "今天", "1", "1d"):
+            days = 1
+        elif token in ("all", "全部", "累计", "total", "0"):
+            days = 0
+        else:
+            try:
+                parsed = int(token.rstrip("d天日"))
+            except ValueError:
+                parsed = 0
+            if parsed <= 0:
+                yield event.plain_result(
+                    "参数无法识别。用法: /usage（近 7 日）/ /usage 30 / "
+                    "/usage today / /usage all"
+                )
+                return
+            days = min(parsed, 730)
+
+        payload = await self._usage_stats_payload(days)
+        if payload.get("error"):
+            yield event.plain_result(f"读取用量统计失败：{payload['error']}")
+            return
+
+        try:
+            async with self._usage_stats_lock:
+                store = self._usage_stats_store()
+                if store is None:
+                    yield event.plain_result("点数用量统计暂不可用（插件数据目录未就绪）。")
+                    return
+                await asyncio.to_thread(store.load)
+                report = format_usage_report(store, days)
+        except Exception as e:
+            logger.warning(f"{LOG_TAG} [cmd:usage] 渲染报告失败: {e!r}")
+            yield event.plain_result(f"读取用量统计失败：{e!r}")
+            return
+
+        yield event.plain_result(report)
 
     @filter.command("imgstatus")
     async def imgstatus(self, event: AstrMessageEvent):

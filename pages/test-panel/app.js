@@ -1,5 +1,5 @@
 /**
- * NAI 生图测试面板 - 前端逻辑 v4.7 (Endfield Protocol)
+ * NAI 生图测试面板 - 前端逻辑 v4.8 (Endfield Protocol)
  *
  * 包含：
  *   - 双提示词框：NAI 风格 + 自然语言
@@ -24,6 +24,7 @@
     sampler: $("sampler"),
     size: $("size"),
     steps: $("steps"),
+    costBadge: $("costBadge"),
     scale: $("scale"),
     cfg: $("cfg"),
     noiseSchedule: $("noiseSchedule"),
@@ -74,11 +75,22 @@
     charListWrap: $("charListWrap"),
     charList: $("charList"),
     charAdd: $("charAdd"),
+    usageRangeSwitch: $("usageRangeSwitch"),
+    usageRefreshBtn: $("usageRefreshBtn"),
+    usageSummary: $("usageSummary"),
+    usageChart: $("usageChart"),
+    usageBreakdown: $("usageBreakdown"),
+    usageEmpty: $("usageEmpty"),
+    usageDisabled: $("usageDisabled"),
+    usageError: $("usageError"),
   };
 
   // ===== 状态 =====
   let isGenerating = false;
   let lastRequestBody = null;
+  // 点数用量统计：当前窗口天数与后端快照
+  let usageDays = 7;
+  let usageData = null;
   // 本地上传参考图列表（OpenAI 兼容格式）：{ b64, dataUrl, name, strength, caption }
   let referenceImages = [];
   // 精准参考描述默认值（后端配置下发，新参考图卡片初始化用）
@@ -106,6 +118,8 @@
     { value: "nai-diffusion-4-5-full", label: "V4.5 完整版 [4.5_FULL]" },
     { value: "nai-diffusion-5-full", label: "V5 完整版 [5.0_FULL]" },
   ];
+  // 是否展示点数预估徽标（后端下发 show_cost_estimate）
+  let panelShowCostEstimate = true;
 
   // ===== 工具函数 =====
   function show(el) { if (el) el.classList.remove("hidden"); }
@@ -431,6 +445,11 @@
         setBadge(els.tokenBadge, "Token: 未配置", "badge-error");
       }
       setBadge(els.baseUrlBadge, config.base_url || "--", "badge-info");
+      // 点数预估开关（后端下发 show_cost_estimate）：徽标是否展示
+      if (typeof config.show_cost_estimate === "boolean") {
+        panelShowCostEstimate = config.show_cost_estimate;
+      }
+      updateCostBadge();
       // 后端下发的 OpenAI 兼容模型列表（对齐接口文档 §9）
       if (Array.isArray(config.openai_models) && config.openai_models.length) {
         openaiModels = config.openai_models;
@@ -505,8 +524,66 @@
     return opt ? `${opt.value}（${opt.tier}）` : value;
   }
 
+  // 任务接口（/api/web/jobs）步数上限。
+  const WEB_JOB_STEPS_MAX = 50;
+
+  // V5 完整版普通画幅起步 8 点（2026-09 上游计费模块；旧版为 5 点）。
   function getModelCostFloor(modelName) {
-    return modelName === "nai-diffusion-5-full" ? 5 : 1;
+    return modelName === "nai-diffusion-5-full" ? 8 : 1;
+  }
+
+  // 步数档位加价：≤28 步 +0，29-35 +4，36-45 +6，46-50 +8。
+  function getStepsExtra(steps) {
+    if (steps > 45) return 8;
+    if (steps > 35) return 6;
+    if (steps > 28) return 4;
+    return 0;
+  }
+
+  // 单张点数（任务接口档位表）；Web 侧镜像 pricing.py 的计价规则：
+  // 画幅基础档 > 1（2K/4K）→ base + extra；V5 标准画幅 → 8 + extra；
+  // V4.5 标准画幅 → 有加价时 2 + extra，否则 1。
+  function computeUnitCost(sizeValue, modelName, steps) {
+    const baseCost = getSizeBaseCost(sizeValue);
+    const capped = Math.max(1, Math.min(parseInt(steps, 10) || 1, WEB_JOB_STEPS_MAX));
+    const extra = getStepsExtra(capped);
+    if (baseCost > 1) return baseCost + extra;
+    const floor = getModelCostFloor(modelName);
+    if (floor > 1) return floor + extra;
+    return extra ? 2 + extra : 1;
+  }
+
+  function getSizeBaseCost(sizeValue) {
+    const opt =
+      SIZE_BASE_COSTS.find((o) => o.value === sizeValue) ||
+      OPENAI_SIZE_OPTIONS.find((o) => o.value === sizeValue);
+    return opt ? opt.baseCost : 1;
+  }
+
+  // 实时刷新点数预估徽标（直连格式显示步数×画质档位；OpenAI 格式隐藏）。
+  // 直连通道固定为任务接口优先（1-50 步档位计价），上游不支持时自动回退 GET 直链。
+  function updateCostBadge() {
+    const badge = els.costBadge;
+    if (!badge) return;
+    if (currentCallFormat === "openai") {
+      hide(badge);
+      return;
+    }
+    if (panelShowCostEstimate === false) {
+      hide(badge);
+      return;
+    }
+    const steps = parseInt(els.steps.value, 10) || 1;
+    const count = parseInt(els.count.value, 10) || 1;
+    const capped = Math.max(1, Math.min(steps, WEB_JOB_STEPS_MAX));
+    const unit = computeUnitCost(els.size.value, els.model.value, steps);
+    let text = `💰 预计 ${unit} 点/张 · 任务接口`;
+    if (count > 1) text += ` · ${count} 张共 ${unit * count} 点`;
+    if (steps !== capped) text += `（步数按 ${capped} 计）`;
+    badge.textContent = text;
+    // 超过基础档（>1 点）时高亮，提示本次为加价档位。
+    badge.classList.toggle("cost-badge-high", unit > 1);
+    show(badge);
   }
 
   function updateSizeOptionsUI() {
@@ -965,6 +1042,8 @@
       }
 
       displayResults(images, body);
+      // 出图成功后刷新点数台账（新消耗已写入统计）
+      await loadUsageStats();
     } catch (err) {
       const msg = err?.message || String(err);
       showError(msg);
@@ -1228,6 +1307,7 @@
     applyRefModeUI();
     updateModelOptionsUI();
     updateSizeOptionsUI();
+    updateCostBadge();
   }
 
   function handleReferenceFileChange() {
@@ -1350,6 +1430,7 @@
       } else {
         await loadTrialStatus();
       }
+      await loadUsageStats();
     } catch (err) {
       const msg = err?.message || String(err);
       showError(msg);
@@ -1360,10 +1441,199 @@
     }
   }
 
+  // ===== 点数用量统计（05 卡片） =====
+
+  // 柱状图 + 趋势折线：rows 为 [{date, cost, count, failed}]，按日期升序。
+  function renderUsageChart(rows) {
+    if (!els.usageChart) return;
+    if (!rows || !rows.length) {
+      els.usageChart.innerHTML = "";
+      return;
+    }
+    const W = 720;
+    const H = 210;
+    const padL = 34;
+    const padR = 10;
+    const padT = 14;
+    const padB = 26;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const n = rows.length;
+    const peak = Math.max(1, ...rows.map((r) => r.cost || 0));
+    const slot = innerW / n;
+    const barW = Math.max(1.5, Math.min(slot * 0.62, 26));
+    const yOf = (value) => padT + innerH - (value / peak) * innerH;
+
+    const parts = [];
+    // 网格线与 Y 轴刻度（4 档）
+    for (let i = 0; i <= 4; i += 1) {
+      const value = Math.round((peak * i) / 4);
+      const y = yOf((peak * i) / 4);
+      parts.push(
+        `<line class="usage-grid-line" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" />`
+      );
+      parts.push(
+        `<text class="usage-axis-text" x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end">${value}</text>`
+      );
+    }
+
+    const centers = [];
+    rows.forEach((row, index) => {
+      const cx = padL + slot * (index + 0.5);
+      const cost = row.cost || 0;
+      const y = yOf(cost);
+      centers.push([cx, y]);
+      const barH = Math.max(cost > 0 ? 1.5 : 0, padT + innerH - y);
+      const title = `${row.date} · ${cost} 点 / ${row.count || 0} 张${
+        row.failed ? ` · 失败 ${row.failed} 次` : ""
+      }`;
+      if (barH > 0) {
+        parts.push(
+          `<rect class="usage-bar" x="${(cx - barW / 2).toFixed(2)}" y="${y.toFixed(
+            2
+          )}" width="${barW.toFixed(2)}" height="${barH.toFixed(2)}" rx="2"><title>${title}</title></rect>`
+        );
+      } else {
+        // 零消耗日：画一个贴地的占位点，保持日期轴连续
+        parts.push(
+          `<rect class="usage-bar" x="${(cx - barW / 2).toFixed(2)}" y="${(
+            padT +
+            innerH -
+            1.5
+          ).toFixed(2)}" width="${barW.toFixed(2)}" height="1.5" rx="0.75" opacity="0.45"><title>${title}</title></rect>`
+        );
+      }
+    });
+
+    if (centers.length > 1) {
+      const points = centers.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+      parts.push(`<polyline class="usage-line" points="${points}" />`);
+    }
+
+    // X 轴标签：最多 10 个，避免拥挤
+    const step = Math.max(1, Math.ceil(n / 10));
+    rows.forEach((row, index) => {
+      if (index % step !== 0 && index !== n - 1) return;
+      const cx = padL + slot * (index + 0.5);
+      parts.push(
+        `<text class="usage-axis-text" x="${cx.toFixed(2)}" y="${H - 8}" text-anchor="middle">${row.date.slice(
+          5
+        )}</text>`
+      );
+    });
+
+    els.usageChart.innerHTML =
+      `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="每日点数消耗">${parts.join("")}</svg>`;
+  }
+
+  function renderUsageSummary(payload) {
+    if (!els.usageSummary) return;
+    const window_ = (payload.windows || {})[String(usageDays)] || {};
+    const overall = payload.overall || {};
+    const today = payload.today || {};
+    const since = payload.first_day ? `自 ${payload.first_day}` : "暂无记录";
+    const cards = [
+      { label: "TODAY // 今日", value: today.cost || 0, unit: "点", sub: `${today.count || 0} 张` },
+      {
+        label: `LAST ${usageDays}D // 近 ${usageDays} 日`,
+        value: window_.cost || 0,
+        unit: "点",
+        sub: `${window_.count || 0} 张 · 日均 ${window_.avg_cost || 0}`,
+      },
+      {
+        label: "PEAK // 峰值",
+        value: window_.peak_cost || 0,
+        unit: "点",
+        sub: window_.peak_date || "—",
+      },
+      {
+        label: "TOTAL // 累计",
+        value: overall.cost || 0,
+        unit: "点",
+        sub: `${overall.count || 0} 张 · ${since}`,
+      },
+    ];
+    els.usageSummary.innerHTML = cards
+      .map(
+        (card) =>
+          `<div class="usage-stat"><span class="usage-stat-label">${card.label}</span>` +
+          `<span class="usage-stat-value">${card.value}<span class="usage-unit">${card.unit}</span></span>` +
+          `<span class="usage-stat-sub">${card.sub}</span></div>`
+      )
+      .join("");
+  }
+
+  function renderUsageBreakdown(payload) {
+    if (!els.usageBreakdown) return;
+    const groups = (payload.breakdowns || {})[String(usageDays)] || {};
+    const labels = { model: "MODEL", size: "SIZE", transport: "CHANNEL" };
+    const html = Object.keys(labels)
+      .map((field) => {
+        const items = groups[field] || [];
+        if (!items.length) return "";
+        const chips = items
+          .map((item) => `<span class="usage-bd-item">${item.name} · ${item.cost} 点</span>`)
+          .join("");
+        return `<div class="usage-bd-row"><span class="usage-bd-tag">${labels[field]}</span><span class="usage-bd-items">${chips}</span></div>`;
+      })
+      .filter(Boolean)
+      .join("");
+    els.usageBreakdown.innerHTML = html;
+  }
+
+  function renderUsage() {
+    if (!usageData) return;
+    const series = usageData.series || [];
+    const rows = series.slice(-usageDays);
+    const hasCost = (usageData.overall || {}).cost > 0;
+    if (els.usageEmpty) els.usageEmpty.classList.toggle("hidden", hasCost);
+    renderUsageSummary(usageData);
+    renderUsageChart(rows);
+    renderUsageBreakdown(usageData);
+  }
+
+  async function loadUsageStats() {
+    if (!els.usageChart) return;
+    try {
+      const bridge = await getBridge();
+      const resp = await bridge.apiGet("test_panel/usage");
+      // 宿主 Bridge 会自动解包 handler 返回 JSON 的 data 字段（response.data?.data ?? response.data），
+      // 因此 resp 可能已是数据本体；兼容两种形态，与 loadTokenStatus 的取值方式保持一致。
+      usageData = (resp && resp.data) ? resp.data : resp;
+      if (!usageData || typeof usageData !== "object") throw new Error("返回数据为空");
+      if (els.usageDisabled) {
+        els.usageDisabled.classList.toggle("hidden", usageData.enabled !== false);
+      }
+      if (els.usageError) els.usageError.classList.add("hidden");
+      if (usageData.enabled === false) {
+        if (els.usageSummary) els.usageSummary.innerHTML = "";
+        if (els.usageChart) els.usageChart.innerHTML = "";
+        if (els.usageBreakdown) els.usageBreakdown.innerHTML = "";
+        if (els.usageEmpty) els.usageEmpty.classList.add("hidden");
+        return;
+      }
+      renderUsage();
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (els.usageError) {
+        els.usageError.textContent = `用量统计加载失败：${msg}`;
+        els.usageError.classList.remove("hidden");
+      }
+    }
+  }
+
   // ===== 事件绑定 =====
   function bindEvents() {
     els.model.addEventListener("change", () => {
       updateSizeOptionsUI();
+      updateCostBadge();
+    });
+    // 步数 / 画幅 / 张数变化时实时刷新点数预估
+    ["steps", "size", "count"].forEach((key) => {
+      const el = els[key];
+      if (!el) return;
+      el.addEventListener("input", updateCostBadge);
+      el.addEventListener("change", updateCostBadge);
     });
     els.style.addEventListener("change", toggleCustomArtists);
     initFormatToggle();
@@ -1392,6 +1662,20 @@
       }
     });
     els.loadDefaultNegative.addEventListener("click", loadDefaultNegative);
+    if (els.usageRefreshBtn) {
+      els.usageRefreshBtn.addEventListener("click", loadUsageStats);
+    }
+    if (els.usageRangeSwitch) {
+      els.usageRangeSwitch.addEventListener("click", (e) => {
+        const btn = e.target.closest(".usage-range-btn");
+        if (!btn) return;
+        usageDays = parseInt(btn.dataset.days, 10) || 7;
+        Array.from(els.usageRangeSwitch.querySelectorAll(".usage-range-btn")).forEach((b) => {
+          b.classList.toggle("is-active", b === btn);
+        });
+        renderUsage();
+      });
+    }
 
     // 所有表单字段变更时自动缓存
     getCachedFields().forEach((key) => {
@@ -1429,10 +1713,13 @@
     updateSizeOptionsUI();
     toggleCustomArtists();
     setCallFormat(currentCallFormat);
+    updateCostBadge();
     // 仅加载 token 状态 badge（不填表单）
     await loadTokenStatus();
     // 加载试用状态
     await loadTrialStatus();
+    // 加载点数用量台账
+    await loadUsageStats();
   }
 
   // DOM 就绪后启动
