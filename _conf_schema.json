@@ -32,6 +32,14 @@
             "call_mode": "direct"
         }
     },
+    "request_timeout": {
+        "type": "int",
+        "default": 180,
+        "description": "请求超时（秒）",
+        "hint": "两种调用模式共用：OpenAI 兼容模式为单次请求超时；直连模式为任务接口排队+生成的总等待上限与 GET 兜底的单请求超时。范围 30-600 秒，大尺寸或上游繁忙时可调大。旧配置的 openai_timeout 值会自动迁移。",
+        "min": 30,
+        "max": 600
+    },
     "show_cost_estimate": {
         "type": "bool",
         "default": true,
@@ -154,7 +162,10 @@
         "type": "string",
         "default": "",
         "description": "自定义画师串",
-        "hint": "仅在「默认风格」选择「自定义」时生效。"
+        "hint": "仅在「默认风格」选择「自定义」时生效。",
+        "condition": {
+            "image_style": "自定义"
+        }
     },
     "steps": {
         "type": "int",
@@ -163,10 +174,12 @@
         "hint": "直连模式经任务接口支持 1-50 步（29 步起按档位加价，46-50 步单价最高）；OpenAI 兼容模式同样限 1-50，超出自动收敛。"
     },
     "scale": {
-        "type": "int",
+        "type": "float",
         "default": 6,
-        "description": "scale",
-        "hint": "提示词引导强度。直连模式限 1-20，OpenAI 兼容模式限 0-10，超出自动收敛。"
+        "description": "提示词引导强度（scale）",
+        "hint": "Prompt 引导强度，数值越高越贴合提示词、越高越锐利，一般 5-7 即可。直连模式限 1-20，OpenAI 兼容模式限 0-10，超出自动收敛。注意别和下面的「CFG Rescale」混淆：那是压暗提亮对比的系数，通常保持默认。",
+        "min": 0,
+        "max": 20
     },
     "cfg": {
         "type": "float",
@@ -180,15 +193,14 @@
         "type": "string",
         "default": "k_dpmpp_2m_sde",
         "description": "采样器",
-        "hint": "不确定时保持默认 k_dpmpp_2m_sde 即可；ddim 仅适用于 nai-diffusion-3 模型（本插件仅支持 V4.5/V5）。",
+        "hint": "不确定时保持默认 k_dpmpp_2m_sde 即可，各选项差异很小。",
         "options": [
             "k_dpmpp_2m_sde",
             "k_dpmpp_2m",
             "k_dpmpp_sde",
             "k_dpmpp_2s_ancestral",
             "k_euler_ancestral",
-            "k_euler",
-            "ddim"
+            "k_euler"
         ]
     },
     "negative": {
@@ -279,17 +291,6 @@
         "description": "随机种子",
         "hint": "-1 表示每次随机（不发送 seed 字段）；填入非负整数可固定种子复现画面。面板可临时覆盖。",
         "min": -1,
-        "condition": {
-            "call_mode": "openai"
-        }
-    },
-    "openai_timeout": {
-        "type": "int",
-        "default": 180,
-        "description": "请求超时（秒）",
-        "hint": "OpenAI 兼容生图单次请求的超时时间，范围 30-600 秒。大尺寸或上游繁忙时可调大。",
-        "min": 30,
-        "max": 600,
         "condition": {
             "call_mode": "openai"
         }

@@ -197,6 +197,7 @@ def test_generate_one_uses_overrides_in_request_and_history():
     plugin = object.__new__(NAIGenerateImagePlugin)
     plugin.image_gen_key = "test-token"
     plugin._session = FakeSession()
+    plugin.request_timeout = 180
     plugin.steps = 24
     plugin.scale = 6
     plugin.cfg_value = 0.0
@@ -301,6 +302,7 @@ def test_generate_one_allows_empty_custom_artist_without_fallback():
     plugin = object.__new__(NAIGenerateImagePlugin)
     plugin.image_gen_key = "test-token"
     plugin._session = FakeSession()
+    plugin.request_timeout = 180
     plugin.steps = 24
     plugin.scale = 6
     plugin.cfg_value = 0.0

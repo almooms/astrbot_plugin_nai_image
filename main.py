@@ -336,8 +336,9 @@ OPENAI_RETRYABLE_STATUS = {408, 429, 502, 503, 504}
 OPENAI_RETRY_DELAYS = (2.0, 4.0, 8.0)
 
 # 任务接口（POST /api/web/jobs）轮询参数：提交/单次轮询/总等待的秒数上限。
-# 总等待与 GET 直链生图共用 180s 上限；上游 /generate 60s 必回，任务接口
-# 排队 + 4K 生成可能更久，但超过 180s 仍按超时处理（上游失败会退点）。
+# 总等待上限自 v2.7.3 起跟随「请求超时」配置（request_timeout，默认 180s），
+# 与 GET 直链生图共用；上游 /generate 60s 必回，任务接口排队 + 4K 生成可能
+# 更久，超过配置上限仍按超时处理（上游失败会退点）。
 WEB_JOB_SUBMIT_TIMEOUT = 30
 WEB_JOB_POLL_INTERVAL = 2.0
 WEB_JOB_POLL_REQUEST_TIMEOUT = 15
@@ -676,7 +677,7 @@ def migrate_invalid_call_mode(config: dict) -> str | None:
     "astrbot_plugin_nai_image",
     "缪缪的小水泡",
     "基于 nai.sta1n.cn 的 NovelAI 生图插件",
-    "2.7.2",
+    "2.7.3",
 )
 class NAIGenerateImagePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -723,9 +724,14 @@ class NAIGenerateImagePlugin(Star):
         except (TypeError, ValueError):
             self.steps = 24
         try:
-            self.scale: int = int(config.get("scale") or 6)
+            # scale 0 是有效值，不能用 `config.get("scale") or 默认值` 读取；
+            # v2.7.3 起支持小数（float）。
+            raw_scale = config.get("scale")
+            self.scale: float = (
+                float(raw_scale) if raw_scale is not None and raw_scale != "" else 6.0
+            )
         except (TypeError, ValueError):
-            self.scale = 6
+            self.scale = 6.0
         try:
             cfg = config.get("cfg")
             # CFG 的 0 是有效值，不能用 `config.get("cfg") or 默认值` 读取。
@@ -735,7 +741,12 @@ class NAIGenerateImagePlugin(Star):
             self.cfg_value: float = max(0.0, min(raw_cfg, 1.0))
         except (TypeError, ValueError):
             self.cfg_value = 1.0
-        self.sampler: str = config.get("sampler") or "k_dpmpp_2m_sde"
+        # ddim 仅适用于 V3 模型，本插件仅支持 V4.5/V5（v2.7.3 起选项里已移除，
+        # 旧配置残留的 ddim 归一化回默认采样器）。
+        _sampler_cfg = (config.get("sampler") or "").strip()
+        if _sampler_cfg == "ddim":
+            _sampler_cfg = ""
+        self.sampler: str = _sampler_cfg or "k_dpmpp_2m_sde"
         # 噪声调度固定 karras（v2.7.2 起移除该配置项）：直连仅支持
         # V4.5/V5，karras 为通用推荐值；--noise 指令参数仍可临时覆盖。
         self.noise_schedule: str = "karras"
@@ -819,11 +830,16 @@ class NAIGenerateImagePlugin(Star):
         except (TypeError, ValueError):
             self.openai_seed = -1
         try:
-            self.openai_timeout: int = max(
-                30, min(600, int(config.get("openai_timeout") or 180))
+            # v2.7.3 起「请求超时」两种调用模式共用；兼容 v2.7.2 及更早的
+            # openai_timeout 旧键，旧值自动迁移，无需用户重新配置。
+            _timeout_cfg = config.get("request_timeout") or config.get(
+                "openai_timeout"
+            )
+            self.request_timeout: int = max(
+                30, min(600, int(_timeout_cfg or 180))
             )
         except (TypeError, ValueError):
-            self.openai_timeout = 180
+            self.request_timeout = 180
         try:
             _retries_cfg = config.get("openai_max_retries")
             self.openai_max_retries: int = max(
@@ -952,7 +968,7 @@ class NAIGenerateImagePlugin(Star):
             f"key={'已配置' if self.openai_api_key else '未配置'} "
             f"model={self.openai_api_model} "
             f"ref_mode={self.openai_reference_mode} seed={self.openai_seed} "
-            f"timeout={self.openai_timeout}s retries={self.openai_max_retries}"
+            f"timeout={self.request_timeout}s retries={self.openai_max_retries}"
         )
         # 按加载后的配置刷新 LLM 生图工具的参数 schema（画风开关 / 尺寸格式）。
         # 工具由装饰器在模块导入时注册，实例化发生在其后，此时改写即时生效。
@@ -1761,7 +1777,7 @@ class NAIGenerateImagePlugin(Star):
             else (model or self.openai_api_model or "").strip()
         )
         api_key = self.openai_api_key
-        timeout = aiohttp.ClientTimeout(total=self.openai_timeout)
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
 
         # ==== 参考图收集：多图列表优先，兼容旧单图参数（§5.2 上限 8 张） ====
         ref_bytes_list: list[bytes] = []
@@ -2417,7 +2433,7 @@ class NAIGenerateImagePlugin(Star):
 
         try:
             async with self._session.get(
-                url, timeout=aiohttp.ClientTimeout(total=180)
+                url, timeout=aiohttp.ClientTimeout(total=self.request_timeout)
             ) as resp:
                 if resp.status != 200:
                     # 读取上游错误正文，方便排查
@@ -2791,7 +2807,7 @@ class NAIGenerateImagePlugin(Star):
                 "openai_director_strength": self.openai_director_strength,
                 "openai_director_secondary_strength": self.openai_director_secondary_strength,
                 "openai_seed": self.openai_seed,
-                "openai_timeout": self.openai_timeout,
+                "request_timeout": self.request_timeout,
                 "openai_max_retries": self.openai_max_retries,
                 "openai_models": OPENAI_COMPATIBLE_MODELS,
                 "openai_director_actions": OPENAI_DIRECTOR_ACTIONS,
@@ -3588,7 +3604,7 @@ class NAIGenerateImagePlugin(Star):
 
         # 轮询直到 done / failed / 超时；单次轮询失败容忍 3 次再判异常。
         poll_failures = 0
-        deadline = time.perf_counter() + WEB_JOB_TOTAL_TIMEOUT
+        deadline = time.perf_counter() + self.request_timeout
         while True:
             job = None
             try:
@@ -3638,7 +3654,7 @@ class NAIGenerateImagePlugin(Star):
                     return None, "exception"
             if time.perf_counter() >= deadline:
                 logger.warning(
-                    f"{LOG_TAG} [web_job] 轮询超时 (>{WEB_JOB_TOTAL_TIMEOUT}s) | "
+                    f"{LOG_TAG} [web_job] 轮询超时 (>{self.request_timeout}s) | "
                     f"id={job_id}"
                 )
                 return None, "timeout"
@@ -3865,7 +3881,7 @@ class NAIGenerateImagePlugin(Star):
         start = time.perf_counter()
         try:
             async with self._session.get(
-                url, timeout=aiohttp.ClientTimeout(total=180)
+                url, timeout=aiohttp.ClientTimeout(total=self.request_timeout)
             ) as resp:
                 elapsed = time.perf_counter() - start
                 if resp.status != 200:

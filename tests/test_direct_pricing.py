@@ -157,6 +157,7 @@ def make_web_job_plugin(session):
     plugin.base_url = "https://nai.example.com"
     plugin.image_gen_key = "STA1N-test-token"
     plugin._session = session
+    plugin.request_timeout = 180
     return plugin
 
 
@@ -296,6 +297,7 @@ def test_generate_one_routes_high_steps_to_web_jobs():
     plugin.image_gen_key = "test-token"
     plugin._session = FakeGetSession()
     plugin.base_url = "https://nai.example.com"
+    plugin.request_timeout = 180
     plugin.steps = 24
     plugin.scale = 6
     plugin.cfg_value = 0.0
@@ -356,6 +358,7 @@ def test_generate_one_falls_back_to_get_when_web_jobs_missing():
     plugin.image_gen_key = "test-token"
     plugin._session = FakeGetSession()
     plugin.base_url = "https://nai.example.com"
+    plugin.request_timeout = 180
     plugin.steps = 24
     plugin.scale = 6
     plugin.cfg_value = 0.0

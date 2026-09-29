@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -115,11 +116,16 @@ def test_failed_requests_do_not_consume_points():
 
 def test_series_fills_zero_days_and_totals():
     store = UsageStatsStore("unused_path.json")
-    store.record(10, count=2, day="2026-09-26")
-    store.record(4, count=1, day="2026-09-28")
+    # series(n) 以"今天"为终点回溯 n 天，预期日期必须相对当天动态计算，
+    # 否则跨天后窗口滑出硬编码日期（曾是 2026-09-26~28 的时间炸弹）。
+    today = date.today()
+    day_older = (today - timedelta(days=2)).isoformat()
+    day_mid = (today - timedelta(days=1)).isoformat()
+    store.record(10, count=2, day=day_older)
+    store.record(4, count=1, day=today.isoformat())
 
     series = store.series(3)
-    assert [row["date"] for row in series] == ["2026-09-26", "2026-09-27", "2026-09-28"]
+    assert [row["date"] for row in series] == [day_older, day_mid, today.isoformat()]
     assert [row["cost"] for row in series] == [10, 0, 4]
 
     totals = store.totals(3)
@@ -127,7 +133,7 @@ def test_series_fills_zero_days_and_totals():
     assert totals["count"] == 3
     assert totals["active_days"] == 2
     assert totals["peak_cost"] == 10
-    assert totals["peak_date"] == "2026-09-26"
+    assert totals["peak_date"] == day_older
     assert totals["avg_cost"] == 7.0  # 14 / 2 个有消耗的日子
 
 
