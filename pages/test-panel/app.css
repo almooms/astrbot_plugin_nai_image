@@ -1737,6 +1737,13 @@ body::before {
   stroke-linecap: round;
 }
 
+.usage-line-upstream {
+  stroke: var(--edge-cyan);
+  stroke-width: 1.3;
+  stroke-dasharray: 4 3;
+  opacity: 0.9;
+}
+
 .usage-grid-line {
   stroke: var(--edge-ink-subtle);
   stroke-width: 1;

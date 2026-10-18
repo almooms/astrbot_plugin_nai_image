@@ -21,6 +21,7 @@ class FakePlugin:
     image_gen_key = "fake-token"
     image_style = "lolita25d"
     image_size = "竖图"
+    call_mode = "direct"
     base_url = "https://nai.sta1n.cn"
     proxy_runner = None
     proxy_port = 8766

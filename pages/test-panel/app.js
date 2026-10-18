@@ -664,7 +664,7 @@
       sampler: els.sampler.value,
       steps: safeInt(els.steps.value, 24),
       scale: safeFloat(els.scale.value, 6),
-      cfg: safeFloat(els.cfg.value, 7),
+      cfg: safeFloat(els.cfg.value, 1),
       noise_schedule: els.noiseSchedule.value,
       model: els.model.value,
       n: safeInt(els.count.value, 1),
@@ -782,6 +782,8 @@
     els.charList.appendChild(row);
 
     promptInput.addEventListener("input", saveCache);
+    xInput.addEventListener("change", saveCache);
+    yInput.addEventListener("change", saveCache);
   }
 
   function clearCharRows() {
@@ -1235,7 +1237,7 @@
     els.sampler.value = "k_dpmpp_2m_sde";
     els.steps.value = "24";
     els.scale.value = "6";
-    els.cfg.value = "7";
+    els.cfg.value = "1";
     els.noiseSchedule.value = "karras";
     els.model.value = "nai-diffusion-4-5-full";
     els.style.value = "vertical";
@@ -1459,7 +1461,10 @@
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
     const n = rows.length;
-    const peak = Math.max(1, ...rows.map((r) => r.cost || 0));
+    const peak = Math.max(
+      1,
+      ...rows.map((r) => Math.max(r.cost || 0, r.upstream_cost || 0))
+    );
     const slot = innerW / n;
     const barW = Math.max(1.5, Math.min(slot * 0.62, 26));
     const yOf = (value) => padT + innerH - (value / peak) * innerH;
@@ -1478,15 +1483,18 @@
     }
 
     const centers = [];
+    const upstreamCenters = [];
     rows.forEach((row, index) => {
       const cx = padL + slot * (index + 0.5);
       const cost = row.cost || 0;
+      const upstreamCost = row.upstream_cost || 0;
       const y = yOf(cost);
       centers.push([cx, y]);
+      upstreamCenters.push([cx, yOf(upstreamCost)]);
       const barH = Math.max(cost > 0 ? 1.5 : 0, padT + innerH - y);
-      const title = `${row.date} · ${cost} 点 / ${row.count || 0} 张${
+      const title = `${row.date} · 估算 ${cost} 点 / ${row.count || 0} 张${
         row.failed ? ` · 失败 ${row.failed} 次` : ""
-      }`;
+      }${upstreamCost ? ` · 上游实际 ${upstreamCost} 点` : ""}`;
       if (barH > 0) {
         parts.push(
           `<rect class="usage-bar" x="${(cx - barW / 2).toFixed(2)}" y="${y.toFixed(
@@ -1508,6 +1516,15 @@
     if (centers.length > 1) {
       const points = centers.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
       parts.push(`<polyline class="usage-line" points="${points}" />`);
+    }
+    // 上游实际扣费（余额同步）：虚线叠加在估算值上，避免两个口径混在一起。
+    if (rows.some((row) => (row.upstream_cost || 0) > 0)) {
+      const upstreamPoints = upstreamCenters
+        .map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`)
+        .join(" ");
+      parts.push(
+        `<polyline class="usage-line usage-line-upstream" points="${upstreamPoints}" />`
+      );
     }
 
     // X 轴标签：最多 10 个，避免拥挤
@@ -1553,6 +1570,34 @@
         sub: `${overall.count || 0} 张 · ${since}`,
       },
     ];
+    const upstream = payload.upstream || {};
+    const upstreamWindow = window_.upstream_cost || 0;
+    const upstreamOverall = overall.upstream_cost || 0;
+    if (
+      payload.upstream_enabled ||
+      upstreamWindow ||
+      upstreamOverall ||
+      upstream.balance != null
+    ) {
+      const syncedAt = upstream.checked_at
+        ? new Date(upstream.checked_at * 1000).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "—";
+      let sub = "等待余额同步";
+      if (upstream.balance != null) {
+        sub = `余额 ${upstream.balance} 点 · ${syncedAt} 同步`;
+      } else if (upstream.last_error) {
+        sub = "同步异常";
+      }
+      cards.push({
+        label: "UPSTREAM // 上游实际",
+        value: upstreamWindow,
+        unit: "点",
+        sub,
+      });
+    }
     els.usageSummary.innerHTML = cards
       .map(
         (card) =>
@@ -1585,7 +1630,11 @@
     if (!usageData) return;
     const series = usageData.series || [];
     const rows = series.slice(-usageDays);
-    const hasCost = (usageData.overall || {}).cost > 0;
+    const overall = usageData.overall || {};
+    const hasCost =
+      (overall.cost || 0) > 0 ||
+      (overall.upstream_cost || 0) > 0 ||
+      (usageData.upstream && usageData.upstream.balance != null);
     if (els.usageEmpty) els.usageEmpty.classList.toggle("hidden", hasCost);
     renderUsageSummary(usageData);
     renderUsageChart(rows);

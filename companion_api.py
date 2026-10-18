@@ -76,10 +76,20 @@ class NAIImageCompanionExtensionAPI:
     def status(self) -> dict[str, Any]:
         """返回插件直连状态快照，供陪伴插件面板与状态查询使用。"""
         plugin = self._plugin
+        call_mode = str(getattr(plugin, "call_mode", "direct") or "direct")
+        if call_mode == "openai":
+            # OpenAI 兼容模式只需要接口地址；直连 token 不参与生图。
+            credential_configured = bool(getattr(plugin, "openai_api_base_url", ""))
+        else:
+            credential_configured = bool(plugin.image_gen_key)
         return {
             "enabled": bool(getattr(plugin, "enable_companion_link", True)),
             "plugin": "astrbot_plugin_nai_image",
+            "call_mode": call_mode,
+            # token_configured 保持原有语义（直连 token）；OpenAI 兼容模式
+            # 是否就绪看 credential_configured。
             "token_configured": bool(plugin.image_gen_key),
+            "credential_configured": credential_configured,
             "base_url": plugin.base_url,
             "default_style": plugin.image_style,
             "default_size": plugin.image_size,
@@ -115,11 +125,18 @@ class NAIImageCompanionExtensionAPI:
         # 只做本地就绪检查，不探测上游：上游可达性探测每次约 1 秒以上，
         # 而陪伴插件会高频轮询本接口，预检会拖慢主动链路；真实失败会由
         # 生图结果以明确的错误信息返回。
-        token_ok = bool(plugin.image_gen_key)
+        call_mode = str(getattr(plugin, "call_mode", "direct") or "direct")
+        if call_mode == "openai":
+            # OpenAI 兼容模式不依赖直连 token，接口地址缺失才是未就绪。
+            credential_ok = bool(getattr(plugin, "openai_api_base_url", ""))
+            credential_reason = "openai_not_configured"
+        else:
+            credential_ok = bool(plugin.image_gen_key)
+            credential_reason = "no_token"
         session_ok = plugin._session is not None and not plugin._session.closed
-        nai_ready = token_ok and session_ok
-        if not token_ok:
-            reason = "no_token"
+        nai_ready = credential_ok and session_ok
+        if not credential_ok:
+            reason = credential_reason
         elif not session_ok:
             reason = "no_session"
         else:
@@ -255,7 +272,7 @@ class NAIImageCompanionExtensionAPI:
             negative = section_negative or None
 
         try:
-            if plugin.call_mode == "openai":
+            if getattr(plugin, "call_mode", "direct") == "openai":
                 # OpenAI 兼容模式：有参考图按插件「参考图使用模式」路由
                 # （vibe/img2img/director），否则文生图；画师串并入 prompt
                 if reference_paths:
@@ -264,7 +281,9 @@ class NAIImageCompanionExtensionAPI:
                         f"参考图 | kind={workflow_kind} "
                         f"first={reference_paths[0][:160]} strength={strength}"
                     )
-                openai_prompt = plugin._openai_prompt(prepared_prompt, style)
+                openai_prompt, _, _ = await plugin._prepare_openai_prompt(
+                    prepared_prompt, style
+                )
                 images, reason = await plugin._openai_generate(
                     openai_prompt,
                     size,
@@ -363,11 +382,18 @@ class NAIImageCompanionExtensionAPI:
             _first_text(endpoint_dict.get("size"), endpoint_dict.get("ratio"))
         )
         try:
-            img_bytes, reason = await plugin._generate_one(
-                normalize_prompt(text),
-                style,
-                size,
-            )
+            if getattr(plugin, "call_mode", "direct") == "openai":
+                openai_prompt, _, _ = await plugin._prepare_openai_prompt(
+                    normalize_prompt(text), style
+                )
+                images, reason = await plugin._openai_generate(openai_prompt, size, n=1)
+                img_bytes = images[0] if images else None
+            else:
+                img_bytes, reason = await plugin._generate_one(
+                    normalize_prompt(text),
+                    style,
+                    size,
+                )
         except Exception as exc:
             logger.warning(f"{_LOG_TAG} 端点测试生图异常: {type(exc).__name__}: {exc}")
             return {"ok": False, "message": f"测试生图异常: {type(exc).__name__}"}

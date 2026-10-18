@@ -14,7 +14,6 @@ import asyncio
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
-from main import NAIGenerateImagePlugin
 from pricing import (
     TRANSPORT_GET,
     TRANSPORT_WEB_JOBS,
@@ -24,6 +23,8 @@ from pricing import (
     web_job_generation_cost,
 )
 
+from main import NAIGenerateImagePlugin
+
 PNG_1PX = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082"
@@ -31,6 +32,7 @@ PNG_1PX = bytes.fromhex(
 
 
 # ===== 计价档位表 =====
+
 
 def test_price_table_matches_upstream_tiers():
     # 上游 README 价目表：V4.5标准 / V5标准 / 2K / 4K
@@ -50,9 +52,18 @@ def test_price_table_matches_upstream_tiers():
 
     # 2K / 4K 与模型无关，在基础档上叠加步数加价
     for steps, extra in ((24, 0), (30, 4), (40, 6), (50, 8)):
-        assert web_job_generation_cost("2K竖图", "nai-diffusion-4-5-full", steps) == 15 + extra
-        assert web_job_generation_cost("2K横图", "nai-diffusion-5-full", steps) == 15 + extra
-        assert web_job_generation_cost("4K方图", "nai-diffusion-4-5-full", steps) == 25 + extra
+        assert (
+            web_job_generation_cost("2K竖图", "nai-diffusion-4-5-full", steps)
+            == 15 + extra
+        )
+        assert (
+            web_job_generation_cost("2K横图", "nai-diffusion-5-full", steps)
+            == 15 + extra
+        )
+        assert (
+            web_job_generation_cost("4K方图", "nai-diffusion-4-5-full", steps)
+            == 25 + extra
+        )
 
 
 def test_web_job_cost_clamps_steps_to_50():
@@ -87,6 +98,7 @@ def test_price_table_lines_render_all_tiers():
 
 # ===== 任务接口通道 =====
 
+
 class _Resp:
     """可编程的假 aiohttp 响应（构造时传入内容，避免嵌套类遮蔽 self）。"""
 
@@ -118,10 +130,20 @@ class FakeWebJobSession:
 
     ERROR_BODY = '{"error": "insufficient balance"}'
 
-    def __init__(self, *, submit_status=202, job_body=None, poll_bodies=None,
-                 image_status=200, image_bytes=PNG_1PX, image_headers=None):
+    def __init__(
+        self,
+        *,
+        submit_status=202,
+        job_body=None,
+        poll_bodies=None,
+        image_status=200,
+        image_bytes=PNG_1PX,
+        image_headers=None,
+    ):
         self.submit_status = submit_status
-        self.job_body = job_body if job_body is not None else {"id": "job_1", "status": "queued"}
+        self.job_body = (
+            job_body if job_body is not None else {"id": "job_1", "status": "queued"}
+        )
         self.poll_bodies = list(poll_bodies or [])
         self.image_status = image_status
         self.image_bytes = image_bytes
@@ -147,7 +169,11 @@ class FakeWebJobSession:
         body = (
             self.poll_bodies.pop(0)
             if self.poll_bodies
-            else {"id": "job_1", "status": "done", "imageUrl": "/api/images/img_1/content"}
+            else {
+                "id": "job_1",
+                "status": "done",
+                "imageUrl": "/api/images/img_1/content",
+            }
         )
         return _Resp(200, body=body)
 
@@ -204,8 +230,15 @@ def test_submit_web_job_clamps_steps_to_50():
 
     asyncio.run(
         plugin._submit_web_job(
-            "1girl", "", "方图", steps=120, scale=6, cfg=0,
-            sampler="k_dpmpp_2m_sde", noise_schedule="karras", negative="",
+            "1girl",
+            "",
+            "方图",
+            steps=120,
+            scale=6,
+            cfg=0,
+            sampler="k_dpmpp_2m_sde",
+            noise_schedule="karras",
+            negative="",
             model="nai-diffusion-4-5-full",
         )
     )
@@ -218,8 +251,15 @@ def test_submit_web_job_returns_unavailable_on_404_for_get_fallback():
 
     img, reason = asyncio.run(
         plugin._submit_web_job(
-            "1girl", "", "方图", steps=40, scale=6, cfg=0,
-            sampler="k_dpmpp_2m_sde", noise_schedule="karras", negative="",
+            "1girl",
+            "",
+            "方图",
+            steps=40,
+            scale=6,
+            cfg=0,
+            sampler="k_dpmpp_2m_sde",
+            noise_schedule="karras",
+            negative="",
             model="nai-diffusion-4-5-full",
         )
     )
@@ -227,13 +267,22 @@ def test_submit_web_job_returns_unavailable_on_404_for_get_fallback():
 
 
 def test_submit_web_job_reports_failed_job():
-    session = FakeWebJobSession(poll_bodies=[{"id": "job_1", "status": "failed", "error": "账号点数不足"}])
+    session = FakeWebJobSession(
+        poll_bodies=[{"id": "job_1", "status": "failed", "error": "账号点数不足"}]
+    )
     plugin = make_web_job_plugin(session)
 
     img, reason = asyncio.run(
         plugin._submit_web_job(
-            "1girl", "", "方图", steps=30, scale=6, cfg=0,
-            sampler="k_dpmpp_2m_sde", noise_schedule="karras", negative="",
+            "1girl",
+            "",
+            "方图",
+            steps=30,
+            scale=6,
+            cfg=0,
+            sampler="k_dpmpp_2m_sde",
+            noise_schedule="karras",
+            negative="",
             model="nai-diffusion-4-5-full",
         )
     )
@@ -246,8 +295,15 @@ def test_submit_web_job_rejects_error_placeholder_image():
 
     img, reason = asyncio.run(
         plugin._submit_web_job(
-            "1girl", "", "方图", steps=30, scale=6, cfg=0,
-            sampler="k_dpmpp_2m_sde", noise_schedule="karras", negative="",
+            "1girl",
+            "",
+            "方图",
+            steps=30,
+            scale=6,
+            cfg=0,
+            sampler="k_dpmpp_2m_sde",
+            noise_schedule="karras",
+            negative="",
             model="nai-diffusion-4-5-full",
         )
     )
@@ -260,8 +316,15 @@ def test_submit_web_job_reports_insufficient_balance_status():
 
     img, reason = asyncio.run(
         plugin._submit_web_job(
-            "1girl", "", "方图", steps=30, scale=6, cfg=0,
-            sampler="k_dpmpp_2m_sde", noise_schedule="karras", negative="",
+            "1girl",
+            "",
+            "方图",
+            steps=30,
+            scale=6,
+            cfg=0,
+            sampler="k_dpmpp_2m_sde",
+            noise_schedule="karras",
+            negative="",
             model="nai-diffusion-4-5-full",
         )
     )
@@ -316,9 +379,7 @@ def test_generate_one_routes_high_steps_to_web_jobs():
     plugin._archive_generated_image = AsyncMock()
     plugin._submit_web_job = AsyncMock(return_value=(b"web-job-image", "ok"))
 
-    result = asyncio.run(
-        plugin._generate_one("1girl", "custom", "横图", steps=40)
-    )
+    result = asyncio.run(plugin._generate_one("1girl", "custom", "横图", steps=40))
 
     assert result == (b"web-job-image", "ok")
     plugin._submit_web_job.assert_awaited_once()
@@ -377,14 +438,22 @@ def test_generate_one_falls_back_to_get_when_web_jobs_missing():
     plugin._archive_generated_image = AsyncMock()
     plugin._submit_web_job = AsyncMock(return_value=(None, "web_jobs_unavailable"))
 
-    result = asyncio.run(plugin._generate_one("1girl", "custom", "横图", steps=40))
+    result = asyncio.run(
+        plugin._generate_one("1girl", "custom", "横图", steps=40, cfg=7.0)
+    )
 
     assert result == (b"legacy-image", "ok")
     query = parse_qs(urlparse(plugin._session.url).query, keep_blank_values=True)
     assert query["size"] == ["横图"]
+    # GET 直链只支持 28 步；越界的 cfg 也在入口收敛到 0-1。
+    assert query["steps"] == ["28"]
+    assert query["cfg"] == ["1.0"]
+    archived = plugin._archive_generated_image.await_args.args[1]
+    assert archived["steps"] == 28
 
 
 # ===== /price 指令 =====
+
 
 class FakePriceEvent:
     def __init__(self, message_str: str):
@@ -410,7 +479,9 @@ def make_price_plugin(*, steps=28, quota=None):
     plugin.steps = steps
     plugin.model = "nai-diffusion-4-5-full"
     plugin.show_cost_estimate = True
-    plugin._fetch_quota = AsyncMock(return_value=quota or {"ok": True, "value": 100, "enabled": True})
+    plugin._fetch_quota = AsyncMock(
+        return_value=quota or {"ok": True, "value": 100, "enabled": True}
+    )
     return plugin
 
 
@@ -442,21 +513,21 @@ def test_price_command_applies_step_tier_and_reports_balance():
     assert "余额不足以完成本次生成" in text
 
 
-def test_price_command_warns_when_steps_exceed_channel_cap():
+def test_price_command_rejects_steps_above_task_interface_cap():
     plugin = make_price_plugin()
-    event = FakePriceEvent("/price --steps=80")
+    event = FakePriceEvent("/price --steps=51")
 
     text = asyncio.run(collect(plugin.price(event)))[0][1]
 
-    assert "步数 80 超过通道上限，实际按 50 步生成并计价" in text
-    assert "预计消耗: 10 点/张" in text
+    assert "1-50" in text
+    plugin._fetch_quota.assert_not_awaited()
 
 
 def test_price_command_rejects_bad_arguments():
     plugin = make_price_plugin()
     results = asyncio.run(collect(plugin.price(FakePriceEvent("/price --steps=0"))))
 
-    assert results[0][1] == "参数错误：参数 --steps 取值范围为 1-100。"
+    assert results[0][1] == "参数错误：参数 --steps 取值范围为 1-50。"
     plugin._fetch_quota.assert_not_awaited()
 
 
@@ -480,6 +551,7 @@ def test_price_command_reports_quota_failure_without_breaking():
 
 
 # ===== /image 回复中的点数标注 =====
+
 
 def test_image_reply_includes_cost_estimate():
     from astrbot.api.message_components import Image

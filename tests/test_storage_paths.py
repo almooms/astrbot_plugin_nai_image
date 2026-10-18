@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import patch
 
-from main import NAIGenerateImagePlugin, PLUGIN_NAME
+from main import PLUGIN_NAME, NAIGenerateImagePlugin
 
 
 def test_plugin_data_dir_uses_astrbot_data_helper(monkeypatch, tmp_path):
@@ -65,8 +65,9 @@ def test_trial_usage_initializes_inside_plugin_data_dir(monkeypatch, tmp_path):
     plugin._trial_usage_count = 0
     plugin._trial_usage_file = None
 
-    with patch("main._TRIAL_KEY_ENC", ""), patch(
-        "main.StarTools.get_data_dir", return_value=expected
+    with (
+        patch("main._TRIAL_KEY_ENC", ""),
+        patch("main.StarTools.get_data_dir", return_value=expected),
     ):
         asyncio.run(plugin._init_trial_feature())
 

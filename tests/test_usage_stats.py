@@ -7,10 +7,10 @@ import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from main import NAIGenerateImagePlugin  # noqa: E402
 from pricing import estimate_openai_cost, pixel_size_cost  # noqa: E402
 from usage_stats import (  # noqa: E402
     UsageStatsStore,
@@ -19,6 +19,8 @@ from usage_stats import (  # noqa: E402
     sparkline,
     today_str,
 )
+
+from main import NAIGenerateImagePlugin  # noqa: E402
 
 
 class FakeUsageEvent:
@@ -74,7 +76,13 @@ def test_sparkline_scales_and_marks_empty_days():
 def test_pixel_size_cost_tiers():
     assert pixel_size_cost("1024x1024") == 1
     assert pixel_size_cost("832x1216") == 1
+    assert pixel_size_cost("1024x1536") == 1
     assert pixel_size_cost("2048x2048") == 15
+    # 2K 方图在 OpenAI 契约下是 1472x1472，最长边不到 1800 也要按面积记 2K
+    assert pixel_size_cost("1472x1472") == 15
+    assert pixel_size_cost("1472*1472") == 15
+    assert pixel_size_cost("1088x1920") == 15
+    assert pixel_size_cost("1344x1344") == 15
     assert pixel_size_cost("4096x2048") == 25
     # 非法输入不抛异常，按普通画幅记
     assert pixel_size_cost("竖图") == 1
@@ -93,10 +101,20 @@ def test_estimate_openai_cost_uses_model_floor():
 
 def test_record_accumulates_cost_and_breakdown():
     store = UsageStatsStore("unused_path.json")
-    store.record(8, transport="web_jobs", model="nai-diffusion-5-full", size="竖图",
-                 day="2026-09-27")
-    store.record(15, transport="get", model="nai-diffusion-5-full", size="2K竖图",
-                 day="2026-09-27")
+    store.record(
+        8,
+        transport="web_jobs",
+        model="nai-diffusion-5-full",
+        size="竖图",
+        day="2026-09-27",
+    )
+    store.record(
+        15,
+        transport="get",
+        model="nai-diffusion-5-full",
+        size="2K竖图",
+        day="2026-09-27",
+    )
 
     bucket = store._data["days"]["2026-09-27"]
     assert bucket["cost"] == 23
@@ -112,6 +130,42 @@ def test_failed_requests_do_not_consume_points():
     assert bucket["cost"] == 0
     assert bucket["failed"] == 1
     assert store.totals(7)["cost"] == 0
+
+
+def test_upstream_charges_are_kept_separate_from_estimates():
+    store = UsageStatsStore("unused_path.json")
+    day = today_str()
+    store.record(10, count=1, day=day)
+    store.record_upstream(8, balance=92.5, checked_at=1_700_000_000, day=day)
+
+    bucket = store._data["days"][day]
+    assert bucket["cost"] == 10
+    assert bucket["upstream_cost"] == 8
+    assert bucket["upstream_events"] == 1
+    state = store.upstream_state()
+    assert state["balance"] == 92.5
+    assert state["last_delta"] == 8
+
+    totals = store.totals(7)
+    assert totals["cost"] == 10
+    assert totals["upstream_cost"] == 8
+    assert totals["upstream_events"] == 1
+    assert store.series(1)[-1]["upstream_cost"] == 8
+
+
+def test_upstream_state_and_cost_persist(tmp_path):
+    path = tmp_path / "usage_stats.json"
+    day = today_str()
+    store = UsageStatsStore(path)
+    store.record_upstream(5, balance=88.0, checked_at=1_700_000_000, day=day)
+    store.save()
+
+    reloaded = UsageStatsStore(path)
+    reloaded.load()
+    assert reloaded.totals(7)["upstream_cost"] == 5
+    state = reloaded.upstream_state()
+    assert state["balance"] == 88.0
+    assert state["last_delta"] == 5
 
 
 def test_series_fills_zero_days_and_totals():
@@ -139,8 +193,10 @@ def test_series_fills_zero_days_and_totals():
 
 def test_breakdown_sorted_by_cost():
     store = UsageStatsStore("unused_path.json")
-    store.record(1, model="nai-diffusion-4-5-full", day="2026-09-28")
-    store.record(12, model="nai-diffusion-5-full", day="2026-09-28")
+    # 窗口以今天为终点，日期必须相对当天生成，避免跨天后滑出统计窗口。
+    day = today_str()
+    store.record(1, model="nai-diffusion-4-5-full", day=day)
+    store.record(12, model="nai-diffusion-5-full", day=day)
     assert store.breakdown(7, "model") == [
         ("nai-diffusion-5-full", 12),
         ("nai-diffusion-4-5-full", 1),
@@ -160,9 +216,9 @@ def test_empty_store_report():
 
 def test_save_and_reload_roundtrip(tmp_path):
     path = tmp_path / "usage_stats.json"
+    day = today_str()
     store = UsageStatsStore(path)
-    store.record(25, count=1, model="nai-diffusion-4-5-full", size="4K竖图",
-                 day="2026-09-28")
+    store.record(25, count=1, model="nai-diffusion-4-5-full", size="4K竖图", day=day)
     store.save()
     assert path.exists()
 
@@ -170,7 +226,7 @@ def test_save_and_reload_roundtrip(tmp_path):
     reloaded.load()
     assert reloaded.totals(7)["cost"] == 25
     assert reloaded.totals(0)["count"] == 1
-    assert reloaded.first_day() == "2026-09-28"
+    assert reloaded.first_day() == day
 
 
 def test_corrupted_file_is_backed_up_not_crashing(tmp_path):
@@ -196,12 +252,35 @@ def test_prune_drops_old_days(tmp_path):
 
 def test_report_contains_all_sections():
     store = UsageStatsStore("unused_path.json")
-    store.record(8, count=1, transport="web_jobs", model="nai-diffusion-5-full",
-                 size="竖图", day="2026-09-27")
-    store.record(15, count=1, transport="get", model="nai-diffusion-5-full",
-                 size="2K竖图", day="2026-09-28")
+    today = date.today()
+    yesterday = (today - timedelta(days=1)).isoformat()
+    store.record(
+        8,
+        count=1,
+        transport="web_jobs",
+        model="nai-diffusion-5-full",
+        size="竖图",
+        day=yesterday,
+    )
+    store.record(
+        15,
+        count=1,
+        transport="get",
+        model="nai-diffusion-5-full",
+        size="2K竖图",
+        day=today.isoformat(),
+    )
     report = format_usage_report(store, 7)
-    for section in ("今日", "近 7 日", "累计", "趋势", "明细", "按模型", "按画幅", "按通道"):
+    for section in (
+        "今日",
+        "近 7 日",
+        "累计",
+        "趋势",
+        "明细",
+        "按模型",
+        "按画幅",
+        "按通道",
+    ):
         assert section in report
     assert "23 点" in report
 
@@ -265,6 +344,63 @@ def test_record_usage_from_parameters_reads_estimated_cost(tmp_path):
     payload = asyncio.run(scenario())
     assert payload["today"]["cost"] == 19
     assert payload["overall"]["cost"] == 19
+
+
+def test_sync_upstream_billing_once_records_balance_drop(tmp_path):
+    async def scenario():
+        plugin = make_usage_plugin(tmp_path)
+        plugin._fetch_quota = AsyncMock(
+            return_value={"ok": True, "balance": 95.0, "value": 95}
+        )
+        baseline = await plugin._sync_upstream_billing_once(100.0)
+        assert baseline == 95.0
+
+        store = plugin._usage_stats_store()
+        store.load()
+        assert store.totals(7)["upstream_cost"] == 5
+        assert store.upstream_state()["balance"] == 95.0
+
+        # 充值/退点：余额增加只更新基线，不计扣费
+        plugin._fetch_quota = AsyncMock(
+            return_value={"ok": True, "balance": 120.0, "value": 120}
+        )
+        baseline = await plugin._sync_upstream_billing_once(baseline)
+        assert baseline == 120.0
+        assert store.totals(7)["upstream_cost"] == 5
+        assert store.upstream_state()["balance"] == 120.0
+
+        # 查询失败：保留原基线，记录错误
+        plugin._fetch_quota = AsyncMock(
+            return_value={"ok": False, "message": "user not found"}
+        )
+        baseline = await plugin._sync_upstream_billing_once(baseline)
+        assert baseline == 120.0
+        assert store.upstream_state()["last_error"] == "user not found"
+
+    asyncio.run(scenario())
+
+
+def test_report_shows_upstream_actual_cost():
+    store = UsageStatsStore("unused_path.json")
+    day = today_str()
+    store.record(10, count=1, day=day)
+    store.record_upstream(8, balance=92.0, checked_at=1_700_000_000, day=day)
+
+    report = format_usage_report(store, 7)
+
+    assert "上游实际扣费: 8 点" in report
+    assert "余额 92 点" in report
+    assert "估算/实际差额: +2 点" in report
+
+
+def test_report_shows_upstream_balance_without_generated_images():
+    store = UsageStatsStore("unused_path.json")
+    store.set_upstream_state(balance=100, checked_at=1_700_000_000)
+
+    report = format_usage_report(store, 7)
+
+    assert "上游实际扣费: 0 点" in report
+    assert "余额 100 点" in report
 
 
 def test_usage_command_default_and_all_and_today(tmp_path):

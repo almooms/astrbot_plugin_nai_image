@@ -55,6 +55,27 @@
         "description": "点数用量统计",
         "hint": "开启后每次成功出图会按日期累计点数消耗，可用 /usage 指令查询，并在测试面板以柱状图/趋势线查看（7/30/90 日）。关闭后不再记录，历史数据保留。"
     },
+    "enable_upstream_billing_sync": {
+        "type": "bool",
+        "default": false,
+        "description": "同步上游余额扣费",
+        "hint": "定时查询生图密钥的上游余额，把相邻两次查询之间的余额减少量记为「上游实际扣费」，与插件按档位表估算的点数分开统计，便于对账。只读取余额，不消耗点数；需要传统 GET 直连模式、开启「点数用量统计」并配置 image_gen_key。上游未开放逐笔扣费明细，因此这是按余额变化推算的总额，会包含同一密钥在网页或其他客户端的用量；停机期间的变化不计入。",
+        "condition": {
+            "call_mode": "direct"
+        }
+    },
+    "upstream_billing_sync_interval": {
+        "type": "int",
+        "default": 10,
+        "description": "余额同步间隔（分钟）",
+        "hint": "每隔多少分钟查询一次上游余额；间隔越短越及时，但请求次数更多。范围 1-1440。",
+        "min": 1,
+        "max": 1440,
+        "condition": {
+            "call_mode": "direct",
+            "enable_upstream_billing_sync": true
+        }
+    },
     "openai_api_base_url": {
         "type": "string",
         "default": "",
@@ -171,7 +192,9 @@
         "type": "int",
         "default": 24,
         "description": "采样步数",
-        "hint": "直连模式经任务接口支持 1-50 步（29 步起按档位加价，46-50 步单价最高）；OpenAI 兼容模式同样限 1-50，超出自动收敛。"
+        "hint": "直连模式经任务接口支持 1-50 步（29 步起按档位加价，46-50 步单价最高）；OpenAI 兼容模式同样限 1-50，超出自动收敛。",
+        "min": 1,
+        "max": 50
     },
     "scale": {
         "type": "float",
@@ -299,7 +322,7 @@
         "type": "int",
         "default": 2,
         "description": "失败重试次数",
-        "hint": "对 408/429/502/503/504 与超时按 2/4/8 秒指数退避重试；400/401/403 不重试。设为 0 不重试。",
+        "hint": "对 408/429/502/503/504 及上游繁忙类瞬时错误按 2/4/8 秒指数退避重试；400/401/403 与请求超时不重试（超时可能仍在生成并扣费，避免重复扣费）。设为 0 不重试。",
         "min": 0,
         "max": 3,
         "condition": {

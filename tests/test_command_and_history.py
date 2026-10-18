@@ -123,6 +123,16 @@ def test_image_command_rejects_unknown_argument_without_generating():
     plugin._generate_one.assert_not_awaited()
 
 
+def test_resolve_direct_size_normalizes_english_and_pixel_values():
+    plugin = object.__new__(NAIGenerateImagePlugin)
+    plugin.image_size = "竖图"
+
+    assert plugin._resolve_direct_size("portrait") == "竖图"
+    assert plugin._resolve_direct_size("1024x1024") == "方图"
+    assert plugin._resolve_direct_size("2048x1024") == "横图"
+    assert plugin._resolve_direct_size("not-a-size") == "竖图"
+
+
 def test_image_command_rejects_char_argument_outside_openai_mode():
     plugin = make_command_plugin("完整", (b"test-image-bytes", "ok"))
     event = FakeCommandEvent('2girls --char="1girl|0.3|0.5"')

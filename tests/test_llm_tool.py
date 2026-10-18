@@ -52,6 +52,11 @@ def make_openai_plugin(generate_result):
     plugin.openai_api_base_url = "https://openai.example"
     plugin.openai_api_key = "sk-test"
     plugin.custom_artists = ""
+    plugin.translate_mode = "关闭"
+    plugin.enable_translate = False
+    plugin.enable_template = False
+    plugin.character_preset = ""
+    plugin.default_outfit = ""
     img_bytes, reason = generate_result
     plugin._openai_generate = AsyncMock(
         return_value=([img_bytes] if img_bytes else [], reason)

@@ -9,6 +9,8 @@ import asyncio
 import base64
 import json
 
+import yaml
+
 from main import OPENAI_MAX_REFERENCE_IMAGES, NAIGenerateImagePlugin
 
 # 1x1 PNG（与陪伴 API 冒烟测试同源），足够让 PIL 完成尺寸适配分支。
@@ -68,6 +70,9 @@ def make_plugin(reference_mode: str = "vibe") -> NAIGenerateImagePlugin:
     plugin.sampler = "k_euler_ancestral"
     plugin.noise_schedule = "karras"
     plugin.negative = ""
+    plugin.save_image_history = False
+    plugin.save_generation_parameters = False
+    plugin.enable_usage_stats = False
     plugin._session = FakeSession()
     return plugin
 
@@ -238,3 +243,79 @@ def test_reference_list_truncated_to_document_limit():
     assert reason == "ok"
     params = last_payload(plugin)["parameters"]
     assert len(params["reference_image_multiple"]) == OPENAI_MAX_REFERENCE_IMAGES
+
+
+def test_openai_generate_archives_history_with_parameters(tmp_path):
+    plugin = make_plugin()
+    plugin.save_image_history = True
+    plugin.save_generation_parameters = True
+    plugin.image_history_limit = 0
+    plugin._image_history_dir = tmp_path / "image_history"
+    plugin._image_history_lock = asyncio.Lock()
+
+    images, reason = asyncio.run(
+        plugin._openai_generate("a girl at the seaside", "1024x1024", n=1)
+    )
+
+    assert reason == "ok" and len(images) == 1
+    saved_images = list(plugin._image_history_dir.glob("nai_*.png"))
+    saved_params = list(plugin._image_history_dir.glob("nai_*.yaml"))
+    # OpenAI 兼容模式此前漏写归档，导致开启「保存生图历史」后仍然没有落盘
+    assert len(saved_images) == 1
+    assert len(saved_params) == 1
+    assert saved_images[0].read_bytes() == PNG_1PX
+    parameters = yaml.safe_load(saved_params[0].read_text(encoding="utf-8"))
+    assert parameters["tag"] == "a girl at the seaside"
+    assert parameters["transport"] == "openai"
+    assert parameters["size"] == "1024x1024"
+    assert parameters["model"] == "nai-diffusion-5-full"
+    assert parameters["steps"] == 24
+
+
+def test_prepare_openai_prompt_applies_template_and_custom_artist():
+    plugin = make_plugin()
+    plugin.translate_mode = "关闭"
+    plugin.enable_translate = False
+    plugin.enable_template = True
+    plugin.character_preset = "masterpiece, best quality"
+    plugin.default_outfit = ""
+
+    full_prompt, outfit_source, prompt_kind = asyncio.run(
+        plugin._prepare_openai_prompt(
+            "1girl, solo",
+            "custom",
+            custom_artists="artist:foo",
+            enable_template=True,
+        )
+    )
+
+    # 模板与 --artist 覆盖都必须进入 OpenAI 模式的最终 prompt
+    assert full_prompt == "artist:foo, masterpiece, best quality, 1girl, solo"
+    assert outfit_source == "none"
+    assert prompt_kind == "off"
+
+
+def test_openai_size_normalizes_english_tier_names():
+    plugin = make_plugin()
+
+    assert plugin._openai_size("portrait") == "832x1216"
+    assert plugin._openai_size("2k_landscape") == "1920x1088"
+    assert plugin._openai_size("4K竖图") == "1088x1920"
+
+
+def test_openai_generate_accepts_data_uri_b64_json():
+    global FAKE_RESPONSE_BODY
+    plugin = make_plugin()
+    original = FAKE_RESPONSE_BODY
+    data_uri = "data:image/png;base64," + base64.b64encode(PNG_1PX).decode()
+    FAKE_RESPONSE_BODY = json.dumps({"data": [{"b64_json": data_uri}]})
+    try:
+        images, reason = asyncio.run(
+            plugin._openai_generate("a girl at the seaside", "1024x1024", n=1)
+        )
+    finally:
+        FAKE_RESPONSE_BODY = original
+
+    # 部分中转会在 b64_json 里原样返回 data URI 前缀，不能直接解码失败
+    assert reason == "ok"
+    assert images == [PNG_1PX]
