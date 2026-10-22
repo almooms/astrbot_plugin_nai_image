@@ -1746,6 +1746,297 @@
     });
   }
 
+  // ===== 画风槽位与法典 =====
+  const slotState = { slots: [], activeId: "1", models: [], enabled: false };
+
+  function slotEls() {
+    return {
+      rows: document.getElementById("slotRows"),
+      add: document.getElementById("btnSlotAdd"),
+      save: document.getElementById("btnSlotSave"),
+      reset: document.getElementById("btnSlotReset"),
+      status: document.getElementById("slotStatus"),
+      grimQuery: document.getElementById("grimQuery"),
+      grimSearch: document.getElementById("btnGrimSearch"),
+      grimResults: document.getElementById("grimResults"),
+    };
+  }
+
+  function unwrapData(resp) {
+    if (resp && typeof resp === "object" && "data" in resp) return resp.data;
+    return resp;
+  }
+
+  function renderSlotRows() {
+    const e = slotEls();
+    if (!e.rows) return;
+    e.rows.textContent = "";
+    if (!slotState.slots.length) {
+      const empty = document.createElement("div");
+      empty.className = "grimoire-empty";
+      empty.textContent = "还没有槽位，点「新增槽位」开始。";
+      e.rows.appendChild(empty);
+      return;
+    }
+    const models = slotState.models.length
+      ? slotState.models
+      : ["nai-diffusion-4-5-full", "nai-diffusion-5-full"];
+
+    slotState.slots.forEach((slot) => {
+      const row = document.createElement("div");
+      row.className = "slot-row";
+
+      const name = document.createElement("input");
+      name.className = "input acrylic-input";
+      name.type = "text";
+      name.placeholder = "画风名";
+      name.value = slot.name || "";
+      name.addEventListener("input", () => {
+        slot.name = name.value;
+      });
+
+      const model = document.createElement("select");
+      model.className = "select acrylic-input";
+      models.forEach((m) => {
+        const opt = document.createElement("option");
+        opt.value = m;
+        opt.textContent = m;
+        if (m === slot.model) opt.selected = true;
+        model.appendChild(opt);
+      });
+      if (slot.model && !models.includes(slot.model)) {
+        const opt = document.createElement("option");
+        opt.value = slot.model;
+        opt.textContent = slot.model;
+        opt.selected = true;
+        model.appendChild(opt);
+      }
+      model.addEventListener("change", () => {
+        slot.model = model.value;
+      });
+
+      const artists = document.createElement("input");
+      artists.className = "input acrylic-input";
+      artists.type = "text";
+      artists.placeholder = "对应画师串";
+      artists.value = slot.artists || "";
+      artists.addEventListener("input", () => {
+        slot.artists = artists.value;
+      });
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn btn-secondary";
+      del.textContent = "删除";
+      del.addEventListener("click", () => {
+        slotState.slots = slotState.slots.filter((s) => s.id !== slot.id);
+        renderSlotRows();
+      });
+
+      row.append(name, model, artists, del);
+      e.rows.appendChild(row);
+    });
+  }
+
+  function refreshSlotStatus() {
+    const e = slotEls();
+    if (!e.status) return;
+    if (!slotState.enabled) {
+      e.status.textContent =
+        "「启用画风槽位」当前是关闭的：这里的槽位可以编辑保存，但不会影响聊天生图。" +
+        "想让它生效，请到插件设置里打开「启用画风槽位」。";
+      return;
+    }
+    const active = slotState.slots.find(
+      (s) => String(s.id) === String(slotState.activeId)
+    );
+    const activeName = active ? active.name || `槽位 ${active.id}` : slotState.activeId;
+    e.status.textContent =
+      `当前聊天生图画风：${activeName}（槽位 ${slotState.activeId}，共 ${slotState.slots.length} 个）。` +
+      "槽位开启时，这里的面板出图也用槽位画师串，上方「画风」下拉不参与；换画风请到插件设置里改「正式生图启用槽位」。";
+  }
+
+  async function loadSlots() {
+    const e = slotEls();
+    if (!e.rows) return;
+    try {
+      const bridge = await getBridge();
+      const resp = await bridge.apiGet("test_panel/slots");
+      const data = unwrapData(resp) || {};
+      slotState.slots = Array.isArray(data.slots)
+        ? data.slots.map((s) => ({
+            id: Number(s.id) || 0,
+            name: String(s.name || ""),
+            model: String(s.model || ""),
+            artists: String(s.artists || ""),
+          }))
+        : [];
+      slotState.activeId = String(data.active_slot_id || "1");
+      slotState.models = Array.isArray(data.model_options) ? data.model_options : [];
+      slotState.enabled = data.enabled === true;
+      renderSlotRows();
+      refreshSlotStatus();
+    } catch (err) {
+      if (e.status) e.status.textContent = `读取槽位失败：${err && err.message ? err.message : err}`;
+    }
+  }
+
+  async function saveSlots() {
+    const e = slotEls();
+    if (!slotState.slots.length) {
+      if (e.status) e.status.textContent = "至少保留一个槽位。";
+      return;
+    }
+    try {
+      const bridge = await getBridge();
+      const resp = await bridge.apiPost("test_panel/slots_save", {
+        slots: slotState.slots,
+      });
+      const data = unwrapData(resp) || {};
+      if (Array.isArray(data.slots) && data.slots.length) {
+        slotState.slots = data.slots.map((s) => ({
+          id: Number(s.id) || 0,
+          name: String(s.name || ""),
+          model: String(s.model || ""),
+          artists: String(s.artists || ""),
+        }));
+        renderSlotRows();
+      }
+      if (e.status) e.status.textContent = "槽位已保存。";
+    } catch (err) {
+      if (e.status) e.status.textContent = `保存失败：${err && err.message ? err.message : err}`;
+    }
+  }
+
+  function appendToNaiPrompt(text) {
+    if (!els.naiPrompt || !text) return;
+    const cur = els.naiPrompt.value.trim();
+    els.naiPrompt.value = cur ? `${cur}, ${text}` : text;
+    els.naiPrompt.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function renderGrimoireResults(items) {
+    const e = slotEls();
+    if (!e.grimResults) return;
+    e.grimResults.textContent = "";
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "grimoire-empty";
+      empty.textContent = "当前模型可用的词库里没有匹配词条，换个短一点的中文关键词试试。";
+      e.grimResults.appendChild(empty);
+      return;
+    }
+    items.forEach((item) => {
+      const card = document.createElement("div");
+      card.className = "grimoire-item";
+
+      const head = document.createElement("div");
+      head.className = "grimoire-item-head";
+
+      const title = document.createElement("span");
+      title.className = "grimoire-item-title";
+      title.textContent = `【${item.title || ""}】`;
+
+      const insert = document.createElement("button");
+      insert.type = "button";
+      insert.className = "btn btn-secondary";
+      insert.textContent = "插入提示词";
+      insert.addEventListener("click", () => appendToNaiPrompt(item.clean_tags || ""));
+
+      head.append(title, insert);
+
+      const meta = document.createElement("div");
+      meta.className = "grimoire-item-meta";
+      meta.textContent = `${item.volume || ""} · ${item.category || ""} · ${item.model_ver || ""}`;
+
+      const tags = document.createElement("div");
+      tags.className = "grimoire-item-tags";
+      tags.textContent = item.clean_tags || "";
+
+      card.append(head, meta, tags);
+      e.grimResults.appendChild(card);
+    });
+  }
+
+  async function searchGrimoire() {
+    const e = slotEls();
+    if (!e.grimQuery) return;
+    const query = e.grimQuery.value.trim();
+    if (!query) return;
+    if (e.grimResults) e.grimResults.textContent = "检索中…";
+    try {
+      const bridge = await getBridge();
+      const resp = await bridge.apiPost("test_panel/grimoire_search", {
+        query,
+        limit: 12,
+      });
+      const payload = unwrapData(resp) || {};
+      if (payload.message && !(payload.items && payload.items.length)) {
+        if (e.grimResults) e.grimResults.textContent = payload.message;
+        return;
+      }
+      renderGrimoireResults(Array.isArray(payload.items) ? payload.items : []);
+    } catch (err) {
+      if (e.grimResults) {
+        e.grimResults.textContent = `检索失败：${err && err.message ? err.message : err}`;
+      }
+    }
+  }
+
+  function bindSlotEvents() {
+    const e = slotEls();
+    if (!e.rows) return;
+    if (e.add) {
+      e.add.addEventListener("click", () => {
+        const nextId = slotState.slots.reduce((m, s) => Math.max(m, Number(s.id) || 0), 0) + 1;
+        slotState.slots.push({
+          id: nextId,
+          name: `新画风 ${nextId}`,
+          model: (slotState.models[0] || "nai-diffusion-4-5-full"),
+          artists: "",
+        });
+        renderSlotRows();
+      });
+    }
+    if (e.save) e.save.addEventListener("click", saveSlots);
+    if (e.reset) {
+      e.reset.addEventListener("click", async () => {
+        if (!window.confirm("会用内置画风重建槽位表，当前槽位（含自定义）会被覆盖，确定吗？")) {
+          return;
+        }
+        try {
+          const bridge = await getBridge();
+          const resp = await bridge.apiPost("test_panel/slots_reset", {});
+          const data = unwrapData(resp) || {};
+          if (Array.isArray(data.slots)) {
+            slotState.slots = data.slots.map((s) => ({
+              id: Number(s.id) || 0,
+              name: String(s.name || ""),
+              model: String(s.model || ""),
+              artists: String(s.artists || ""),
+            }));
+            renderSlotRows();
+            refreshSlotStatus();
+          }
+          if (e.status) e.status.textContent = "已恢复为内置画风。";
+        } catch (err) {
+          if (e.status) {
+            e.status.textContent = `恢复失败：${err && err.message ? err.message : err}`;
+          }
+        }
+      });
+    }
+    if (e.grimSearch) e.grimSearch.addEventListener("click", searchGrimoire);
+    if (e.grimQuery) {
+      e.grimQuery.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          searchGrimoire();
+        }
+      });
+    }
+  }
+
   // ===== 初始化 =====
   async function init() {
     console.log(
@@ -1769,6 +2060,9 @@
     await loadTrialStatus();
     // 加载点数用量台账
     await loadUsageStats();
+    // 加载画风槽位与法典面板
+    bindSlotEvents();
+    await loadSlots();
   }
 
   // DOM 就绪后启动

@@ -31,6 +31,12 @@ if __package__:
         strip_image_command_prefix,
     )
     from .companion_api import NAIImageCompanionExtensionAPI
+    from .grimoire_service import (
+        build_grimoire_translation_hint,
+        expand_grimoire_macros,
+        normalize_model_ver,
+        search_grimoire,
+    )
     from .pricing import (
         DIRECT_URL_STEPS_MAX,
         TRANSPORT_GET,
@@ -66,6 +72,12 @@ else:
         parse_image_command,
         strip_image_command_prefix,
     )
+    from grimoire_service import (
+        build_grimoire_translation_hint,
+        expand_grimoire_macros,
+        normalize_model_ver,
+        search_grimoire,
+    )
     from pricing import (
         DIRECT_URL_STEPS_MAX,
         TRANSPORT_GET,
@@ -95,6 +107,20 @@ else:
     )
 
 LOG_TAG = "[NAI-Image]"
+
+# 画风槽位表结构版本。v2 起改为「内置画风预设」形式，旧默认会被自动升级。
+_SLOTS_VERSION = 2
+
+# 只在提示词转译开启时有意义的配置项：转译关闭时整块从设置页隐藏，
+# 运行时也一律不参与任何请求。AstrBot 的 schema condition 只支持「单值
+# 相等」，无法表达"开启 或 自动"，所以由插件按当前转译模式动态改写这些
+# 条目的 condition（见 _sync_translate_visibility）。
+TRANSLATE_GATED_KEYS = (
+    "translate_provider",
+    "default_outfit",
+    "enable_outfit_cache",
+    "outfit_cache_ttl_seconds",
+)
 
 _IMAGE_PROMPT_SPEC_PATH = Path(__file__).resolve().parents[1] / "image_prompt_spec.txt"
 
@@ -689,7 +715,7 @@ def migrate_invalid_call_mode(config: dict) -> str | None:
     "astrbot_plugin_nai_image",
     "缪缪的小水泡",
     "基于 nai.sta1n.cn 的 NovelAI 生图插件",
-    "2.8.0",
+    "2.9.0",
 )
 class NAIGenerateImagePlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -731,6 +757,12 @@ class NAIGenerateImagePlugin(Star):
         self._image_history_lock = asyncio.Lock()
         self.custom_artists: str = config.get("custom_artists") or ""
         self.model: str = config.get("model") or "nai-diffusion-4-5-full"
+        # 正式生图启用的槽位（槽位表本身存在插件数据目录的 artist_slots.json）。
+        self.active_artist_slot: str = str(
+            config.get("active_artist_slot") or "1"
+        ).strip() or "1"
+        self._slots_cache: list[dict[str, Any]] | None = None
+        self._slots_cache_mtime: float = 0.0
         try:
             self.steps: int = max(1, min(50, int(config.get("steps") or 24)))
         except (TypeError, ValueError):
@@ -933,6 +965,17 @@ class NAIGenerateImagePlugin(Star):
         # 「开启画风参数」：控制 LLM 生图工具是否向模型暴露 style 参数；
         # 关闭时工具自动使用「默认风格」设置里选好的画风。
         self.enable_tool_style: bool = bool(config.get("enable_tool_style", True))
+        # ==== 增强功能开关（一律默认关闭，不改变升级前的任何行为）====
+        # 多角色块：开启后工具才向模型暴露 char1_prompt / char2_prompt。
+        self.enable_character_blocks: bool = bool(
+            config.get("enable_character_blocks", False)
+        )
+        # 法典词库：开启后才做检索、宏展开与转译参考注入。
+        self.enable_grimoire: bool = bool(config.get("enable_grimoire", False))
+        # 画风槽位：开启后槽位绑定的模型/画师串才覆盖原来的配置。
+        self.enable_artist_slots: bool = bool(
+            config.get("enable_artist_slots", False)
+        )
 
         # ==== 陪伴插件直连（extension API）与本地代理开关 ====
         self.enable_companion_link: bool = bool(
@@ -1097,6 +1140,391 @@ class NAIGenerateImagePlugin(Star):
 
         return StarTools.get_data_dir(PLUGIN_NAME)
 
+    # ------------------------------------------------------------------
+    # 画风槽位（名称 + 绑定模型 + 专属画师串）
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 画风槽位（画风名 + 适用模型 + 对应画师串）
+    # 数据存在插件配置的 artist_slots 里（设置页的 template_list，可直接编辑）；
+    # 旧的 artist_slots.json 只在首次加载时做一次性迁移。
+    # ------------------------------------------------------------------
+    def _config_path(self) -> Path:
+        """返回本插件配置文件的绝对路径。"""
+
+        from astrbot.core.utils.astrbot_path import get_astrbot_config_path
+
+        return Path(get_astrbot_config_path()) / f"{PLUGIN_NAME}_config.json"
+
+    def _schema_path(self) -> Path:
+        return Path(__file__).resolve().parent / "_conf_schema.json"
+
+    def _read_plugin_config(self) -> Any:
+        """读取插件配置（带 schema，保证缺省键有值）。"""
+
+        from astrbot.core.config.astrbot_config import AstrBotConfig
+
+        schema = json.loads(self._schema_path().read_text(encoding="utf-8-sig"))
+        return AstrBotConfig(config_path=str(self._config_path()), schema=schema)
+
+    def _write_plugin_config(self, updates: dict[str, Any]) -> None:
+        """把若干键写回插件配置；未提供的键保持不变。"""
+
+        cfg = self._read_plugin_config()
+        for key, value in updates.items():
+            cfg[key] = value
+        cfg.save_config()
+
+    def _slots_cache_key(self) -> float:
+        try:
+            return self._config_path().stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _default_artist_slots(self) -> list[dict[str, Any]]:
+        """内置画风预设：每个内置画风一个槽位，默认绑定 V4.5 full。
+
+        当前生效画风排到第一位，保证「开启画风槽位」后第一次出图的结果与
+        开启前完全一致（用户不会因为开了开关而突然换了画风）。
+        """
+
+        current = str(getattr(self, "image_style", "") or "").strip()
+        # 配置里可能存的是中文标签（如「自定义」），统一归一化成内部风格键。
+        if current not in IMAGE_STYLES:
+            current = normalize_image_style(current) or current
+        keys = list(IMAGE_STYLES.keys())
+        if current not in keys:
+            current = "vertical"
+        ordered = [current] + [key for key in keys if key != current]
+        slots: list[dict[str, Any]] = []
+        for index, key in enumerate(ordered, 1):
+            if key == "custom":
+                artists = str(getattr(self, "custom_artists", "") or "")
+            else:
+                artists = DEFAULT_ARTISTS.get(key, "")
+            slots.append(
+                {
+                    "id": index,
+                    "name": IMAGE_STYLES.get(key, key),
+                    "model": "nai-diffusion-4-5-full",
+                    "artists": artists,
+                }
+            )
+        return slots
+
+    @staticmethod
+    def _normalize_slot(item: Any) -> dict[str, Any] | None:
+        """把一条槽位记录规整成固定结构；完全空的记录返回 None。"""
+
+        if not isinstance(item, dict):
+            return None
+        name = str(item.get("name") or "").strip()
+        model = str(item.get("model") or "").strip()
+        artists = str(item.get("artists") or "").strip()
+        if not (name or model or artists):
+            return None
+        return {
+            "name": name or "未命名画风",
+            "model": model,
+            "artists": artists,
+        }
+
+    def _normalize_slots(self, raw: Any) -> list[dict[str, Any]]:
+        """规整整个槽位表；id 按列表顺序重新编号（1 起）。"""
+
+        if not isinstance(raw, list):
+            return []
+        slots: list[dict[str, Any]] = []
+        for item in raw:
+            slot = self._normalize_slot(item)
+            if slot is None:
+                continue
+            slot["id"] = len(slots) + 1
+            slots.append(slot)
+        return slots
+
+    @staticmethod
+    def _looks_like_legacy_defaults(slots: list[dict[str, Any]]) -> bool:
+        """判断槽位表是否还是旧版的「槽位 N · xx 默认」两条出厂值。"""
+
+        if len(slots) != 2:
+            return False
+        for slot in slots:
+            name = str(slot.get("name") or "")
+            if not name.startswith("槽位 ") or "默认" not in name:
+                return False
+        return True
+
+    @staticmethod
+    def _to_config_items(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """转成 template_list 需要的结构（每项带 __template_key）。"""
+
+        return [
+            {
+                "__template_key": "style",
+                "name": str(slot.get("name") or ""),
+                "model": str(slot.get("model") or ""),
+                "artists": str(slot.get("artists") or ""),
+            }
+            for slot in slots
+        ]
+
+    def _migrate_legacy_slot_file(self) -> list[dict[str, Any]]:
+        """把旧版 artist_slots.json 迁移成槽位表（一次性，成功后改名备份）。"""
+
+        try:
+            path = self._get_plugin_data_dir() / "artist_slots.json"
+            if not path.is_file():
+                return []
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            items = data.get("slots") if isinstance(data, dict) else data
+            slots = self._normalize_slots(items)
+            backup = path.with_name(f"{path.name}.migrated-{int(time.time())}")
+            path.replace(backup)
+            if slots and self._looks_like_legacy_defaults(slots):
+                # 出厂的两条默认值没有迁移价值，直接用内置画风预设。
+                logger.info(f"{LOG_TAG} 旧槽位文件为出厂默认值，改用内置画风预设")
+                return []
+            if slots:
+                logger.info(
+                    f"{LOG_TAG} 已把旧槽位文件迁移到插件配置 | count={len(slots)}"
+                )
+            return slots
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} 迁移旧槽位文件失败: {exc!r}")
+            return []
+
+    def _load_artist_slots(self) -> list[dict[str, Any]]:
+        """读取画风槽位表（数据源是插件配置，设置页与面板共用同一份）。"""
+
+        mtime = self._slots_cache_key()
+        if self._slots_cache is not None and mtime == self._slots_cache_mtime:
+            return self._slots_cache
+
+        raw_slots: Any = None
+        try:
+            raw_slots = self._read_plugin_config().get("artist_slots")
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} 读取画风槽位配置失败: {exc!r}")
+
+        slots = self._normalize_slots(raw_slots)
+
+        if not slots:
+            migrated = self._migrate_legacy_slot_file()
+            slots = migrated or self._default_artist_slots()
+            try:
+                self._write_plugin_config(
+                    {"artist_slots": self._to_config_items(slots)}
+                )
+                logger.info(f"{LOG_TAG} 已初始化画风槽位 | count={len(slots)}")
+            except Exception as exc:
+                logger.warning(f"{LOG_TAG} 写入画风槽位配置失败: {exc!r}")
+
+        self._slots_cache = slots
+        self._slots_cache_mtime = self._slots_cache_key()
+        return slots
+
+    def _save_artist_slots(self, slots: list[dict[str, Any]]) -> None:
+        """保存画风槽位表，并同步「正式生图启用槽位」下拉里显示的名字。"""
+
+        normalized = self._normalize_slots(slots)
+        if not normalized:
+            raise ValueError("槽位表不能为空")
+
+        self._write_plugin_config({"artist_slots": self._to_config_items(normalized)})
+        self._slots_cache = normalized
+        self._slots_cache_mtime = self._slots_cache_key()
+        self._sync_slot_labels(normalized)
+
+    def _sync_slot_labels(self, slots: list[dict[str, Any]]) -> None:
+        """把槽位名写进 schema 下拉的 labels，让设置页显示改后的画风名。
+
+        AstrBot 的设置页由静态 schema 生成，下拉的选项文字只能靠改写 schema
+        同步。这里做原子写，且只在内容变化时才落盘；只读部署下失败只提醒一次。
+        """
+
+        try:
+            schema_path = self._schema_path()
+            schema = json.loads(schema_path.read_text(encoding="utf-8-sig"))
+            node = schema.get("active_artist_slot")
+            if not isinstance(node, dict):
+                return
+            options = [str(slot["id"]) for slot in slots]
+            labels = [f"{slot['id']}. {slot['name']}" for slot in slots]
+            if node.get("options") == options and node.get("labels") == labels:
+                return
+            node["options"] = options
+            node["labels"] = labels
+            if str(node.get("default")) not in options and options:
+                node["default"] = options[0]
+            tmp_path = schema_path.with_name(schema_path.name + ".tmp")
+            tmp_path.write_text(
+                json.dumps(schema, ensure_ascii=False, indent=4) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(schema_path)
+            logger.debug(f"{LOG_TAG} 已同步槽位下拉标签 | {labels}")
+        except Exception as exc:
+            if not getattr(self, "_slot_label_warned", False):
+                self._slot_label_warned = True
+                logger.warning(
+                    f"{LOG_TAG} 同步槽位下拉标签失败（插件目录可能只读），"
+                    f"设置页将显示槽位编号而不是画风名: {exc!r}"
+                )
+
+    def _ensure_artist_slots(self) -> None:
+        """启动时确保槽位配置存在，并把画风名同步到设置页下拉。"""
+
+        slots = self._load_artist_slots()
+        self._sync_slot_labels(slots)
+
+    # ------------------------------------------------------------------
+    # 提示词转译：关闭时相关配置整块隐藏、且运行时完全不参与请求
+    # ------------------------------------------------------------------
+    def _translate_on(self) -> bool:
+        """提示词转译当前是否启用（开启 / 自动）。"""
+
+        mode = getattr(self, "translate_mode", None)
+        if mode is not None:
+            return normalize_translate_mode(mode) != TRANSLATE_MODE_OFF
+        # 兼容只设置旧版布尔属性的实例与测试桩。
+        return bool(getattr(self, "enable_translate", False))
+
+    def _translate_condition_value(self) -> str:
+        """返回转译相关条目在 schema 里应比较的转译模式值。
+
+        开启/自动时返回该模式本身（条目显示）；关闭时没有可显示的启用模式，
+        这里返回「开启」——与当前值「关闭」不相等，条目即被隐藏。
+        """
+
+        mode = normalize_translate_mode(
+            getattr(self, "translate_mode", TRANSLATE_MODE_OFF)
+        )
+        if mode == TRANSLATE_MODE_OFF:
+            return TRANSLATE_MODE_ON
+        return mode
+
+    def _sync_translate_visibility(self) -> None:
+        """按当前转译模式改写 schema，让转译专属配置在关闭时整块隐藏。
+
+        设置页用静态 schema 渲染，条件只支持「单值相等」，因此无法直接写
+        「开启 或 自动」。这里在每次插件加载时把条件值改成当前模式：关闭时
+        改成「开启」（不相等 → 隐藏），开启/自动时改成自身（相等 → 显示）。
+        只读部署写失败时只提醒一次，退化为"条目常显但运行时不生效"。
+        """
+
+        value = self._translate_condition_value()
+        try:
+            schema_path = self._schema_path()
+            schema = json.loads(schema_path.read_text(encoding="utf-8-sig"))
+            changed = False
+            for key in TRANSLATE_GATED_KEYS:
+                node = schema.get(key)
+                if not isinstance(node, dict):
+                    continue
+                condition = node.get("condition")
+                if not isinstance(condition, dict):
+                    condition = {}
+                if condition.get("enable_translate") == value:
+                    continue
+                condition["enable_translate"] = value
+                node["condition"] = condition
+                changed = True
+            if not changed:
+                return
+            tmp_path = schema_path.with_name(schema_path.name + ".tmp")
+            tmp_path.write_text(
+                json.dumps(schema, ensure_ascii=False, indent=4) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(schema_path)
+            logger.debug(
+                f"{LOG_TAG} 转译专属配置显隐已同步 | translate={value} "
+                f"keys={list(TRANSLATE_GATED_KEYS)}"
+            )
+        except Exception as exc:
+            if not getattr(self, "_translate_visibility_warned", False):
+                self._translate_visibility_warned = True
+                logger.warning(
+                    f"{LOG_TAG} 同步转译配置显隐失败（插件目录可能只读），"
+                    f"转译专属配置将常显但关闭时不生效: {exc!r}"
+                )
+
+    def _active_artist_slot(self) -> dict[str, Any] | None:
+        """返回正式生图当前启用的槽位；配置指向不存在的槽位时回退第一个。"""
+
+        slots = self._load_artist_slots()
+        try:
+            wanted = int(str(getattr(self, "active_artist_slot", "1") or "1"))
+        except (TypeError, ValueError):
+            wanted = 1
+        for slot in slots:
+            if slot["id"] == wanted:
+                return slot
+        if slots:
+            logger.debug(
+                f"{LOG_TAG} 配置的槽位 {wanted} 不存在，回退到槽位 {slots[0]['id']}"
+            )
+            return slots[0]
+        return None
+
+    def _slot_model(self) -> str:
+        """当前槽位绑定的模型（未启用槽位或未绑定则为空串）。"""
+
+        if not self._artist_slots_enabled():
+            return ""
+        if not hasattr(self, "active_artist_slot"):
+            # 测试桩/半初始化实例：不触发配置读写。
+            return ""
+        slot = self._active_artist_slot()
+        return str((slot or {}).get("model") or "").strip()
+
+    def _slot_artists(self) -> str:
+        """当前槽位绑定的画师串（未启用槽位或未绑定则为空串）。"""
+
+        if not self._artist_slots_enabled():
+            return ""
+        if not hasattr(self, "active_artist_slot"):
+            return ""
+        slot = self._active_artist_slot()
+        return str((slot or {}).get("artists") or "").strip()
+
+    def _match_style_slot(self, value: str) -> dict[str, Any] | None:
+        """按「画风名」匹配槽位，匹配不到返回 None。
+
+        容忍常见噪音：前后空格、大小写、"1. " 这类编号前缀、全半角中点，
+        这样模型传「2 韩漫小清新风」或用户传「韩漫小清新风」都能命中。
+        """
+
+        if not self._artist_slots_enabled():
+            return None
+        name = str(value or "").strip()
+        if not name:
+            return None
+        slots = self._load_artist_slots()
+        for slot in slots:
+            if slot["name"] == name:
+                return slot
+
+        def compact(text: str) -> str:
+            return re.sub(r"[\s\d.、·．]+", "", text).casefold()
+
+        target = compact(name)
+        if not target:
+            return None
+        for slot in slots:
+            if compact(slot["name"]) == target:
+                return slot
+        return None
+
+    def _persist_active_slot(self, slot_id: str) -> None:
+        """把「正式生图启用槽位」写回插件配置；失败只告警。"""
+
+        try:
+            self._write_plugin_config({"active_artist_slot": str(slot_id)})
+            self.active_artist_slot = str(slot_id)
+            logger.info(f"{LOG_TAG} 正式生图槽位已切换为 {slot_id}")
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} 写入生效槽位失败: {exc!r}")
     def _migrate_legacy_data_dir(self) -> None:
         """把旧版工作目录下的数据整体迁移到 AstrBot 插件数据目录。"""
 
@@ -1476,6 +1904,18 @@ class NAIGenerateImagePlugin(Star):
         except Exception as exc:
             logger.warning(f"{LOG_TAG} [initialize] 旧版数据目录迁移异常: {exc!r}")
 
+        # 1.5) 确保画风槽位存在，并把画风名同步到设置页的槽位下拉。
+        try:
+            await asyncio.to_thread(self._ensure_artist_slots)
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [initialize] 画风槽位初始化异常: {exc!r}")
+
+        # 1.6) 转译关闭时，把转译专属配置从设置页整块隐藏。
+        try:
+            await asyncio.to_thread(self._sync_translate_visibility)
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [initialize] 转译配置显隐同步异常: {exc!r}")
+
         # 2) aiohttp session —— 失败也继续，至少把代理先起来
         #    trust_env：开启「绕过系统代理」时忽略环境变量代理，强制直连
         #    生图站，避免梯子的 HTTP 代理出口把请求带偏。
@@ -1576,6 +2016,30 @@ class NAIGenerateImagePlugin(Star):
                 self._test_panel_usage,
                 ["GET"],
                 "NAI 测试面板：点数用量统计（按日期）",
+            )
+            self.context.register_web_api(
+                f"{PAGE_API_PREFIX}/slots",
+                self._test_panel_slots,
+                ["GET"],
+                "NAI 测试面板：读取画风槽位表",
+            )
+            self.context.register_web_api(
+                f"{PAGE_API_PREFIX}/slots_save",
+                self._test_panel_slots_save,
+                ["POST"],
+                "NAI 测试面板：保存画风槽位表",
+            )
+            self.context.register_web_api(
+                f"{PAGE_API_PREFIX}/slots_reset",
+                self._test_panel_slots_reset,
+                ["POST"],
+                "NAI 测试面板：按内置画风重建槽位表",
+            )
+            self.context.register_web_api(
+                f"{PAGE_API_PREFIX}/grimoire_search",
+                self._test_panel_grimoire_search,
+                ["POST"],
+                "NAI 测试面板：检索内置法典词库",
             )
             logger.info(
                 f"{LOG_TAG} [initialize] 测试面板 Web API 已注册 | prefix={PAGE_API_PREFIX}"
@@ -1862,6 +2326,14 @@ class NAIGenerateImagePlugin(Star):
             artists = normalize_prompt(
                 DEFAULT_ARTISTS.get(style, DEFAULT_ARTISTS["vertical"])
             )
+        # 槽位绑定的画师串优先级高于风格预设，但低于本次显式指定的画师串。
+        if custom_artists is None:
+            try:
+                slot_artists = self._slot_artists()
+            except Exception:
+                slot_artists = ""
+            if slot_artists:
+                artists = normalize_prompt(slot_artists)
         if not artists:
             return normalize_prompt(prompt)
         return normalize_prompt(f"{artists}, {prompt}")
@@ -2020,7 +2492,7 @@ class NAIGenerateImagePlugin(Star):
         model = (
             "director-tools"
             if is_director
-            else (model or self.openai_api_model or "").strip()
+            else (model or self._slot_model() or self.openai_api_model or "").strip()
         )
         api_key = self.openai_api_key
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
@@ -2644,7 +3116,7 @@ class NAIGenerateImagePlugin(Star):
         _sampler = sampler if sampler is not None else self.sampler
         _noise = noise_schedule if noise_schedule is not None else self.noise_schedule
         _negative = negative if negative is not None else self.negative
-        _model = model if model is not None else self.model
+        _model = model if model is not None else (self._slot_model() or self.model)
         _enable_template = (
             enable_template if enable_template is not None else self.enable_template
         )
@@ -2914,8 +3386,8 @@ class NAIGenerateImagePlugin(Star):
         except Exception:
             return error_response("请求体解析失败", status_code=400)
 
-        nai_prompt = normalize_prompt(body.get("nai_prompt") or "")
-        nl_prompt = normalize_prompt(body.get("nl_prompt") or "")
+        nai_prompt = normalize_prompt(self._expand_grimoire(body.get("nai_prompt") or ""))
+        nl_prompt = normalize_prompt(self._expand_grimoire(body.get("nl_prompt") or ""))
         if not nai_prompt and not nl_prompt:
             return error_response("请至少填写一个提示词框", status_code=400)
 
@@ -3095,6 +3567,119 @@ class NAIGenerateImagePlugin(Star):
             }
         )
 
+    async def _test_panel_slots(self) -> Any:
+        """Web API: 读取画风槽位表与当前生效槽位。"""
+        try:
+            slots = await asyncio.to_thread(self._load_artist_slots)
+            # 顺手把画风名同步到设置页下拉，用户打开面板即完成一次同步。
+            await asyncio.to_thread(self._sync_slot_labels, slots)
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [panel:slots] 读取失败: {exc!r}")
+            return error_response(f"读取槽位失败: {exc!r}", status_code=500)
+        return json_response(
+            {
+                "status": "ok",
+                "data": {
+                    "slots": slots,
+                    "active_slot_id": self.active_artist_slot,
+                    "enabled": self._artist_slots_enabled(),
+                    "model_options": OPENAI_COMPATIBLE_MODELS,
+                },
+            }
+        )
+
+    async def _test_panel_slots_save(self) -> Any:
+        """Web API: 保存画风槽位表；可选同时切换正式生效槽位。"""
+        try:
+            body = await web_request.json(default={})
+        except Exception:
+            return error_response("请求体解析失败", status_code=400)
+        if not isinstance(body, dict):
+            return error_response("请求体格式错误", status_code=400)
+
+        raw_slots = body.get("slots")
+        if not isinstance(raw_slots, list) or not raw_slots:
+            return error_response("slots 必须是非空数组", status_code=400)
+        try:
+            await asyncio.to_thread(self._save_artist_slots, raw_slots)
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [panel:slots] 保存失败: {exc!r}")
+            return error_response(f"保存槽位失败: {exc!r}", status_code=400)
+
+        active = body.get("active_slot_id")
+        if active not in (None, ""):
+            await asyncio.to_thread(self._persist_active_slot, str(active))
+
+        slots = await asyncio.to_thread(self._load_artist_slots)
+        logger.info(
+            f"{LOG_TAG} [panel:slots] 已保存 | count={len(slots)} "
+            f"active={self.active_artist_slot}"
+        )
+        return json_response(
+            {
+                "status": "ok",
+                "data": {"slots": slots, "active_slot_id": self.active_artist_slot},
+            }
+        )
+
+    async def _test_panel_slots_reset(self) -> Any:
+        """Web API: 用内置画风重建槽位表（会覆盖现有槽位）。"""
+        try:
+            slots = await asyncio.to_thread(self._default_artist_slots)
+            await asyncio.to_thread(self._save_artist_slots, slots)
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [panel:slots] 重置失败: {exc!r}")
+            return error_response(f"恢复内置画风失败: {exc!r}", status_code=500)
+        logger.info(f"{LOG_TAG} [panel:slots] 已按内置画风重建 | count={len(slots)}")
+        return json_response(
+            {
+                "status": "ok",
+                "data": {"slots": slots, "active_slot_id": self.active_artist_slot},
+            }
+        )
+
+    async def _test_panel_grimoire_search(self) -> Any:
+        """Web API: 按当前生效模型检索内置法典词库。"""
+        if not self._grimoire_enabled():
+            return json_response(
+                {
+                    "status": "disabled",
+                    "data": {
+                        "items": [],
+                        "message": "内置法典词库未启用，请到插件设置里打开「启用内置法典词库」。",
+                    },
+                }
+            )
+        try:
+            body = await web_request.json(default={})
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        query = str(body.get("query") or "").strip()
+        try:
+            limit = int(body.get("limit") or 12)
+        except (TypeError, ValueError):
+            limit = 12
+        try:
+            hits = await asyncio.to_thread(
+                search_grimoire, query, limit, self._active_model_ver()
+            )
+        except Exception as exc:
+            logger.warning(f"{LOG_TAG} [panel:grimoire] 检索失败: {exc!r}")
+            return error_response(f"检索失败: {exc!r}", status_code=500)
+        return json_response(
+            {
+                "status": "ok",
+                "data": {
+                    "items": hits,
+                    "model_ver": self._active_model_ver(),
+                    "total_db": 19663,
+                },
+            }
+        )
+
+
     async def _test_panel_get_config(self) -> Any:
         """Web API: 返回当前插件配置（脱敏 token）。"""
         return json_response(
@@ -3160,8 +3745,8 @@ class NAIGenerateImagePlugin(Star):
         except Exception:
             return error_response("请求体解析失败", status_code=400)
 
-        nai_prompt = normalize_prompt(body.get("nai_prompt") or "")
-        nl_prompt = normalize_prompt(body.get("nl_prompt") or "")
+        nai_prompt = normalize_prompt(self._expand_grimoire(body.get("nai_prompt") or ""))
+        nl_prompt = normalize_prompt(self._expand_grimoire(body.get("nl_prompt") or ""))
         if not nai_prompt and not nl_prompt:
             return error_response("请至少填写一个提示词框", status_code=400)
 
@@ -3291,8 +3876,8 @@ class NAIGenerateImagePlugin(Star):
         except Exception:
             return error_response("请求体解析失败", status_code=400)
 
-        nai_prompt = normalize_prompt(body.get("nai_prompt") or "")
-        nl_prompt = normalize_prompt(body.get("nl_prompt") or "")
+        nai_prompt = normalize_prompt(self._expand_grimoire(body.get("nai_prompt") or ""))
+        nl_prompt = normalize_prompt(self._expand_grimoire(body.get("nl_prompt") or ""))
 
         # director-tools 图片处理动作（§8）：指定时强制使用 director-tools 模型，
         # 提示词可为空，但必须附带一张源图片。
@@ -3611,21 +4196,10 @@ class NAIGenerateImagePlugin(Star):
                 logger.warning(f"{LOG_TAG} [quota] 请求异常: {e!r}")
             return {"ok": False, "message": f"请求异常: {type(e).__name__}"}
 
-    def _resolve_translate_provider_id(self) -> str | None:
-        """根据配置和上下文，选出转译用的 provider ID。
+    def _default_provider_id(self) -> str | None:
+        """取 AstrBot 当前默认 provider 的 ID；取不到返回 None。"""
 
-        - self.translate_provider 留空 → 取 AstrBot 当前默认 provider
-        - 自填 ID → 用 get_provider_by_id 校验；不通过则回退默认；默认也取不到则返回 None
-        """
-        chosen = (self.translate_provider or "").strip()
         try:
-            if chosen:
-                prov = self.context.get_provider_by_id(chosen)
-                if prov:
-                    return chosen
-                logger.warning(
-                    f"{LOG_TAG} [translate] provider '{chosen}' 不存在，回退默认"
-                )
             # 默认 provider（v4.5.7+ context.get_using_provider() 可不传 umo）
             prov = self.context.get_using_provider()
             if prov is not None:
@@ -3640,8 +4214,53 @@ class NAIGenerateImagePlugin(Star):
                     return cfg.get("id")
             return None
         except Exception as e:
+            logger.warning(f"{LOG_TAG} [provider] 获取默认 provider 异常: {e!r}")
+            return None
+
+    def _resolve_translate_provider_id(self) -> str | None:
+        """根据配置和上下文，选出转译用的 provider ID。
+
+        转译关闭时直接返回 None：此时「转译模型供应商」不参与任何请求，
+        连 AstrBot 默认 provider 也不去解析。
+
+        - self.translate_provider 留空 → 取 AstrBot 当前默认 provider
+        - 自填 ID → 用 get_provider_by_id 校验；不通过则回退默认；默认也取不到则返回 None
+        """
+        if not self._translate_on():
+            logger.debug(f"{LOG_TAG} [translate] 转译已关闭，不解析转译 provider")
+            return None
+
+        chosen = (self.translate_provider or "").strip()
+        if not chosen:
+            return self._default_provider_id()
+        try:
+            prov = self.context.get_provider_by_id(chosen)
+            if prov:
+                return chosen
+            logger.warning(
+                f"{LOG_TAG} [translate] provider '{chosen}' 不存在，回退默认"
+            )
+            return self._default_provider_id()
+        except Exception as e:
             logger.warning(f"{LOG_TAG} [translate] 选择 provider 异常: {e!r}")
             return None
+
+    def _resolve_interrogate_provider_id(self) -> str:
+        """反推用的 provider ID。
+
+        「图片反推多模态模型」独立于转译：未单独配置时，仅在转译开启时才
+        借用「转译模型供应商」，否则交给 AstrBot 默认 provider，避免转译
+        关闭后仍被一个看不见的配置项影响。
+        """
+
+        chosen = (self.interrogate_provider or "").strip()
+        if chosen:
+            return chosen
+        if self._translate_on():
+            borrowed = (self.translate_provider or "").strip()
+            if borrowed:
+                return borrowed
+        return ""
 
     async def _translate_prompt(self, prompt: str, *, force: bool = False) -> str:
         """如果开启转译，把自然语言 prompt 转成 SD/NAI 标签风格。
@@ -3652,7 +4271,7 @@ class NAIGenerateImagePlugin(Star):
         """
         import re as _re
 
-        if not force and not self.enable_translate:
+        if not force and not self._translate_on():
             return prompt
         if not prompt or not prompt.strip():
             return prompt
@@ -3669,6 +4288,19 @@ class NAIGenerateImagePlugin(Star):
             f"in_len={len(prompt)} preview='{prompt[:60]}...'"
         )
 
+        # 命中内置法典时，把该模型版本下的实测词条作为参考一并交给转译模型。
+        # 仅在「启用内置法典词库」开启时生效，关闭时不检索、不注入。
+        grimoire_hint = ""
+        if self._grimoire_enabled():
+            grimoire_hint = build_grimoire_translation_hint(
+                prompt, model_ver=self._active_model_ver()
+            )
+        llm_input_prompt = f"{prompt}{grimoire_hint}" if grimoire_hint else prompt
+        if grimoire_hint:
+            logger.info(
+                f"{LOG_TAG} [translate] 法典命中参考词条 | hint_len={len(grimoire_hint)}"
+            )
+
         response = None
         # === 优先使用 v4.5.7+ 推荐的 context.llm_generate ===
         try:
@@ -3676,7 +4308,7 @@ class NAIGenerateImagePlugin(Star):
             if llm_generate is not None:
                 response = await llm_generate(
                     chat_provider_id=provider_id,
-                    prompt=prompt,
+                    prompt=llm_input_prompt,
                     # TRANSLATE_SYSTEM_PROMPT 已内含可选的共享规范文本；
                     # 单独传 IMAGE_PROMPT_SPEC 会丢掉下面的转译指令。
                     system_prompt=TRANSLATE_SYSTEM_PROMPT,
@@ -3700,13 +4332,13 @@ class NAIGenerateImagePlugin(Star):
                     return prompt
                 try:
                     response = await prov.text_chat(
-                        prompt=prompt,
+                        prompt=llm_input_prompt,
                         system_prompt=TRANSLATE_SYSTEM_PROMPT,
                         temperature=0.4,
                     )
                 except TypeError:
                     # 极老 provider 不接受 system_prompt
-                    response = await prov.text_chat(prompt=prompt)
+                    response = await prov.text_chat(prompt=llm_input_prompt)
             except Exception as e:
                 logger.warning(
                     f"{LOG_TAG} [translate] 调用 provider 异常: {e!r}，原样透传"
@@ -3776,6 +4408,57 @@ class NAIGenerateImagePlugin(Star):
         )
         return translated
 
+    def _grimoire_enabled(self) -> bool:
+        """法典词库是否启用。默认关闭：不查库、不展开宏、不注入转译参考。"""
+
+        return bool(getattr(self, "enable_grimoire", False))
+
+    def _character_blocks_enabled(self) -> bool:
+        """多角色块是否启用。默认关闭：工具不向模型暴露角色块参数。"""
+
+        return bool(getattr(self, "enable_character_blocks", False))
+
+    def _artist_slots_enabled(self) -> bool:
+        """画风槽位是否启用。默认关闭：完全忽略槽位，按原配置出图。"""
+
+        return bool(getattr(self, "enable_artist_slots", False))
+
+    def _expand_grimoire(self, prompt: str) -> str:
+        """展开提示词里的【法典:词条名】宏；法典功能关闭时原样返回。"""
+
+        if not self._grimoire_enabled() or not prompt:
+            return prompt
+        return expand_grimoire_macros(prompt, model_ver=self._active_model_ver())
+
+    def _active_model_ver(self) -> str:
+        """当前生效模型对应的词库版本（``NAI4.5`` / ``NAI5``）。
+
+        两套调用通道用的模型配置不同：传统 GET 用 ``model``，OpenAI 兼容用
+        ``openai_api_model``。词库必须锁定到当前通道真正会用的那个模型，
+        避免 V4.5 检索到 V5 的词条。
+        """
+
+        call_mode = str(getattr(self, "call_mode", "direct") or "direct")
+        # 槽位绑定的模型优先，其次是各通道自己的模型配置。
+        try:
+            slot_model = self._slot_model()
+        except Exception:
+            slot_model = ""
+        if slot_model:
+            return normalize_model_ver(slot_model)
+        if call_mode == "openai":
+            model = str(getattr(self, "openai_api_model", "") or "")
+        else:
+            model = str(getattr(self, "model", "") or "")
+        if not model:
+            # 测试桩/半初始化实例可能只设了其中一项。
+            model = str(
+                getattr(self, "openai_api_model", "")
+                or getattr(self, "model", "")
+                or ""
+            )
+        return normalize_model_ver(model)
+
     async def _prepare_translated_prompt(
         self,
         prompt: str,
@@ -3790,7 +4473,9 @@ class NAIGenerateImagePlugin(Star):
         语言片段交给 LLM，再按原位置和现有 NAI 标签合并。``apply_outfit``
         用于区分启用服装缓存逻辑的 Bot 流程与不启用该逻辑的 WebUI 流程。
         """
-        raw_prompt = normalize_prompt(prompt)
+        raw_prompt = normalize_prompt(
+            self._expand_grimoire(prompt)
+        )
         current_mode = getattr(self, "translate_mode", None)
         # 兼容只设置旧版 enable_translate 布尔属性的实例和测试桩。
         if current_mode is None:
@@ -4134,7 +4819,7 @@ class NAIGenerateImagePlugin(Star):
         _sampler = sampler if sampler is not None else self.sampler
         _noise = noise_schedule if noise_schedule is not None else self.noise_schedule
         _negative = negative if negative is not None else self.negative
-        _model = model if model is not None else self.model
+        _model = model if model is not None else (self._slot_model() or self.model)
         _enable_template = (
             enable_template if enable_template is not None else self.enable_template
         )
@@ -4168,8 +4853,14 @@ class NAIGenerateImagePlugin(Star):
             )
         full_prompt = normalize_prompt(full_prompt)
 
-        # 自定义风格允许空画师串（不强制回退预设）
-        if style == "custom":
+        # 自定义风格允许空画师串（不强制回退预设）。
+        # 优先级：本次显式指定 > 槽位绑定 > 自定义/风格预设。
+        slot_artists = self._slot_artists()
+        if custom_artists is not None and str(custom_artists).strip():
+            artists = str(custom_artists)
+        elif slot_artists:
+            artists = slot_artists
+        elif style == "custom":
             artists = (
                 custom_artists if custom_artists is not None else self.custom_artists
             )
@@ -4757,7 +5448,6 @@ class NAIGenerateImagePlugin(Star):
             }
         )
 
-    @filter.command("image")
     def _resolve_direct_size(self, size_cn: str) -> str:
         """传统 GET 模式的尺寸归一化：必须产出上游识别的中文分档名。
 
@@ -4787,6 +5477,7 @@ class NAIGenerateImagePlugin(Star):
                 size = self.image_size
         return size
 
+    @filter.command("image")
     async def image(self, event: AstrMessageEvent):
         """处理 `/image` 指令，并将命名参数作为本次生图的临时覆盖值。
 
@@ -5139,7 +5830,7 @@ class NAIGenerateImagePlugin(Star):
                 "请附带图片，或使用 /nai_interrogate <图片路径或URL> [补充要求]。"
             )
             return
-        provider_id = self.interrogate_provider or self.translate_provider
+        provider_id = self._resolve_interrogate_provider_id()
         provider = None
         if provider_id:
             provider = self.context.get_provider_by_id(provider_id)
@@ -5219,6 +5910,25 @@ class NAIGenerateImagePlugin(Star):
             # 生图回退到插件设置的默认画风。
             if not self.enable_tool_style:
                 props.pop("style", None)
+            elif self._artist_slots_enabled() and "style" in props:
+                # 槽位开启时，把画风参数的取值限定为「槽位里的画风名」，
+                # 模型就能直接认人话里的画风名（而不是那 7 个内部风格键）。
+                try:
+                    slot_names = [s["name"] for s in self._load_artist_slots()]
+                except Exception:
+                    slot_names = []
+                if slot_names:
+                    props["style"]["description"] = (
+                        "画风名。只能从插件设置里的画风槽位中选一个："
+                        + " / ".join(slot_names)
+                        + "。选中后该槽位绑定的模型与画师串会一起生效。"
+                        "留空则使用「正式生图启用槽位」里选中的画风。"
+                    )
+                    props["style"]["enum"] = slot_names
+            # 「启用多角色块」关闭时隐藏角色块参数，模型看不到就不会去拆角色。
+            if not self._character_blocks_enabled():
+                props.pop("char1_prompt", None)
+                props.pop("char2_prompt", None)
             if self.call_mode == "openai":
                 default_size = self._openai_size(self.image_size)
                 if "size_cn" in props:
@@ -5236,9 +5946,31 @@ class NAIGenerateImagePlugin(Star):
             params["properties"] = props
             params["type"] = "object"
             tool.parameters = params
+
+            # 法典检索工具：未启用时把描述标成不可用（不改动 AstrBot 的全局
+            # 停用列表，避免污染用户手动配置的工具开关），并在 handler 内直接拒绝。
+            grimoire_tool = manager.get_func("NAI_Search_Grimoire") if manager else None
+            if grimoire_tool is not None:
+                original_desc = getattr(grimoire_tool, "_nai_original_desc", None)
+                if original_desc is None:
+                    original_desc = str(getattr(grimoire_tool, "description", "") or "")
+                    object.__setattr__(
+                        grimoire_tool, "_nai_original_desc", original_desc
+                    )
+                if self._grimoire_enabled():
+                    object.__setattr__(grimoire_tool, "description", original_desc)
+                else:
+                    object.__setattr__(
+                        grimoire_tool,
+                        "description",
+                        "（内置法典词库未启用，本工具不可用，请勿调用。）",
+                    )
+
             logger.debug(
                 f"{LOG_TAG} [tool] NAI_Generate_Image schema 已按配置刷新 | "
                 f"style字段={'显示' if self.enable_tool_style else '隐藏'} "
+                f"角色块={'显示' if self._character_blocks_enabled() else '隐藏'} "
+                f"法典工具={'启用' if self._grimoire_enabled() else '停用'} "
                 f"尺寸格式={'分辨率' if self.call_mode == 'openai' else '分档'}"
             )
         except Exception as exc:
@@ -5255,6 +5987,8 @@ class NAIGenerateImagePlugin(Star):
         prompt: str = "",
         style: str = "",
         size_cn: str = "",
+        char1_prompt: str = "",
+        char2_prompt: str = "",
     ) -> AsyncGenerator[str, None]:
         """用NovelAI生成1张图片并直接发送给当前用户。
 
@@ -5278,8 +6012,10 @@ class NAIGenerateImagePlugin(Star):
                 示例：masterpiece, best quality, {人物 [1girl, solo, long hair, blue eyes, source#hug], {位置左}, ntags = [lowres, bad anatomy] 人物}, {人物 [1boy, short hair, target#hug], {位置右} 人物}, outdoor, sunset, artist:wlop
             style(string): 画风。可选：vertical(韩漫小清新风) / comicDoujin(漫画同人风) / r18(2.5D唯美风) / lolita25d(2.5D唯美风（萝）) / anime(本子里番风) / galgame(GalGame风) / custom(自定义)。留空使用插件设置的默认画风。
             size_cn(string): 图片尺寸，留空使用插件设置的默认尺寸。OpenAI 兼容调用模式下为像素分辨率 "宽x高"（如 832x1216，宽高须为 64 的倍数）；传统 GET 模式下为分档名：竖图 / 横图 / 方图 / 2K竖图 / 2K横图 / 2K方图 / 4K竖图 / 4K横图 / 4K方图
+            char1_prompt(string): 【角色块1】只写第一个角色自身的标签：外貌、发色瞳色、表情、姿势动作、穿着及其局部状态（如 1girl, solo, long hair, blue eyes, smile, sitting）。留空表示画面只有一个角色。不要把场景、构图、画风写在这里。
+            char2_prompt(string): 【角色块2】第二个角色自身的标签，写法同上。填写后两个角色会分别放到画面左右，各自独立不串色；双人互动时用 source#动作 / target#动作 表示发起方与承受方。
         """
-        prompt = normalize_prompt(prompt)
+        prompt = normalize_prompt(self._expand_grimoire(prompt))
         if not self.enable_llm_tool:
             logger.warning(
                 f"{LOG_TAG} [tool:NAI_Generate_Image] 生图工具已禁用，请在插件设置中开启 enable_llm_tool"
@@ -5293,11 +6029,28 @@ class NAIGenerateImagePlugin(Star):
         raw_style = str(style or "").strip()
         if raw_style == "自定义":
             raw_style = "custom"
-        # 「开启画风参数」关闭或未传画风时，固定使用插件设置里选好的默认画风；
-        # 工具 schema 会同步隐藏 style 字段（见 _refresh_llm_tool_schema）。
-        style = (
-            raw_style if (self.enable_tool_style and raw_style) else self.image_style
-        )
+        # 优先把 style 当作「画风槽位名」来匹配：槽位开启时，模型可以直接按
+        # 用户在设置页起的画风名选画风，该槽位绑定的模型与画师串一起生效。
+        style_slot = self._match_style_slot(raw_style) if raw_style else None
+        if style_slot is not None:
+            style = normalize_image_style(self.image_style) or "vertical"
+            slot_model = str(style_slot.get("model") or "")
+            slot_artists = str(style_slot.get("artists") or "")
+            logger.info(
+                f"{LOG_TAG} [tool:NAI_Generate_Image] 命中画风槽位 "
+                f"'{style_slot['name']}' | model={slot_model or '默认'} "
+                f"artists={'有' if slot_artists else '无'}"
+            )
+        else:
+            slot_model = ""
+            slot_artists = ""
+            # 「开启画风参数」关闭或未传画风时，固定使用插件设置里选好的默认画风；
+            # 工具 schema 会同步隐藏 style 字段（见 _refresh_llm_tool_schema）。
+            style = (
+                raw_style
+                if (self.enable_tool_style and raw_style)
+                else normalize_image_style(self.image_style) or "vertical"
+            )
         if not prompt:
             logger.info(f"{LOG_TAG} [tool:NAI_Generate_Image] prompt 为空")
             yield "生成失败，提示词不应为空"
@@ -5315,9 +6068,11 @@ class NAIGenerateImagePlugin(Star):
                 yield "生成失败，未配置 image_gen_key，请告知用户先在插件配置中填写 token。"
                 return
 
-        if style not in IMAGE_STYLES and style != "custom":
+        if style_slot is None and style not in IMAGE_STYLES and style != "custom":
             logger.warning(f"{LOG_TAG} [tool:NAI_Generate_Image] 未知风格: {style}")
-            yield f"未知风格: {style}\n可选: {', '.join(IMAGE_STYLES.keys())}"
+            slot_names = [s["name"] for s in self._load_artist_slots()] if self._artist_slots_enabled() else []
+            choices = slot_names + list(IMAGE_STYLES.keys())
+            yield f"未知风格: {style}\n可选: {', '.join(choices)}"
             return
 
         # 尺寸按调用模式归一化：OpenAI 兼容模式直接使用像素分辨率（宽x高），
@@ -5379,6 +6134,45 @@ class NAIGenerateImagePlugin(Star):
         if hasattr(event, "set_extra"):
             event.set_extra("_nai_image_generation_state", "running")
 
+        # 多角色块：把 char1/char2 转成当前通道能表达的形式。
+        # 未开启「启用多角色块」时忽略这两个参数，保持升级前的单 prompt 行为。
+        char_blocks: list[str] = []
+        if self._character_blocks_enabled():
+            char_blocks = [
+                normalize_prompt(self._expand_grimoire(c))
+                for c in (char1_prompt, char2_prompt)
+                if str(c or "").strip()
+            ]
+        elif str(char1_prompt or "").strip() or str(char2_prompt or "").strip():
+            logger.info(
+                f"{LOG_TAG} [tool:NAI_Generate_Image] 多角色块未启用，已忽略 "
+                f"char1/char2 参数"
+            )
+        characters: list[tuple[str, float, float]] | None = None
+        if char_blocks and self.call_mode == "openai":
+            if len(char_blocks) == 1:
+                characters = [(char_blocks[0], 0.5, 0.5)]
+            else:
+                # 双角色分别居中于左右半幅，避免两个角色块互相污染。
+                characters = [
+                    (char_blocks[0], 0.25, 0.5),
+                    (char_blocks[1], 0.75, 0.5),
+                ]
+        elif char_blocks:
+            # 传统 GET 通道没有坐标数组，改用上游支持的多角色块语法表达。
+            wrapped: list[str] = []
+            for idx, block in enumerate(char_blocks[:2]):
+                if len(char_blocks) > 1:
+                    pos = "{位置左}" if idx == 0 else "{位置右}"
+                    wrapped.append("{人物 [" + block + "], " + pos + " 人物}")
+                else:
+                    wrapped.append("{人物 [" + block + "] 人物}")
+            prompt = normalize_prompt(", ".join([prompt] + wrapped))
+            logger.info(
+                f"{LOG_TAG} [tool:NAI_Generate_Image] 直连模式多角色块已并入 prompt"
+                f" | chars={len(wrapped)}"
+            )
+
         logger.info(
             f"{LOG_TAG} [tool:NAI_Generate_Image] 最终参数 | style={style} size_cn={size_cn} "
             f"size={size} n=1"
@@ -5387,15 +6181,25 @@ class NAIGenerateImagePlugin(Star):
         logger.info(f"{LOG_TAG} [tool:NAI_Generate_Image] 生成第 1/1 张")
         try:
             if self.call_mode == "openai":
-                openai_prompt, _, _ = await self._prepare_openai_prompt(prompt, style)
+                openai_prompt, _, _ = await self._prepare_openai_prompt(
+                    prompt, style, custom_artists=slot_artists or None
+                )
                 images, reason = await self._openai_generate(
                     openai_prompt,
                     size,
                     n=1,
+                    characters=characters,
+                    model=slot_model or None,
                 )
                 img_bytes = images[0] if images else None
             else:
-                img_bytes, reason = await self._generate_one(prompt, style, size)
+                img_bytes, reason = await self._generate_one(
+                    prompt,
+                    style,
+                    size,
+                    model=slot_model or None,
+                    custom_artists=slot_artists or None,
+                )
         except Exception as exc:
             logger.warning(f"{LOG_TAG} [tool:NAI_Generate_Image] 生成异常: {exc!r}")
             img_bytes, reason = None, "exception"
@@ -5477,7 +6281,7 @@ class NAIGenerateImagePlugin(Star):
         size_cn = args.size or self.image_size
         size = self._resolve_direct_size(size_cn)
         steps = args.steps if args.steps is not None else self.steps
-        model = args.model or self.model
+        model = args.model or self._slot_model() or self.model
         n = args.n if args.n is not None else self.image_count
 
         unit_cost = web_job_generation_cost(size, model, steps)
@@ -5633,3 +6437,77 @@ class NAIGenerateImagePlugin(Star):
             "（开启时忽略系统/环境代理；TUN 类梯子需在梯子软件里给 nai.sta1n.cn 加直连规则）"
         )
         yield event.plain_result("\n".join(lines))
+
+    @filter.llm_tool(name="NAI_Search_Grimoire")
+    async def NAI_Search_Grimoire(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+    ) -> str:
+        """在内置 NovelAI 法典词库（19,663 条实测 Tag 组合，NAI4.5 与 NAI5 分卷）中检索画风、服饰、姿势、视角、特殊玩法等 Tag。
+
+        检索范围自动跟随当前生图模型：V5 会同时查 V5 与 V4.5 两卷（新底模兼容旧词条，同名优先 V5）；V4.5 只查 V4.5 卷。
+
+        需要特定画风、精致穿搭、复杂互动姿势时，可先调用本工具取现成的实测 Tag 组合；
+        也可以直接在 NAI_Generate_Image 的 prompt 里写【法典:词条名】，生图时会自动展开。
+
+        Args:
+            query(string): 检索关键词（如：死库水、旗袍、自拍、丝袜、动画画风），支持空格分隔多个词。
+        """
+        if not self._grimoire_enabled():
+            return "内置法典词库未启用，请在插件设置中开启「启用内置法典词库」后再使用。"
+        if not getattr(self, "enable_llm_tool", False):
+            return "生图工具已被管理员禁用，法典检索当前不可用。"
+        hits = await asyncio.to_thread(
+            search_grimoire, query, 8, self._active_model_ver()
+        )
+        if not hits:
+            return (
+                f"未在法典词库中找到与 '{query}' 匹配的词条，"
+                f"请尝试缩短或更换中文关键词。"
+            )
+        lines = [
+            f"📖 NovelAI 法典检索结果（共命中 {len(hits)} 条，"
+            f"可直接把 Tags 用于 NAI_Generate_Image）："
+        ]
+        for i, h in enumerate(hits, 1):
+            lines.append(
+                f"{i}. 【{h['title']}】({h['volume']} · {h['category']})\n"
+                f"   Tags: {h['clean_tags']}"
+            )
+        return "\n".join(lines)
+
+    @filter.command("法典", alias={"grimoire", "查法典"})
+    async def cmd_grimoire(self, event: AstrMessageEvent):
+        """检索内置 NovelAI 法典词条。用法：/法典 关键词"""
+        if not self._grimoire_enabled():
+            yield event.plain_result(
+                "内置法典词库未启用。请到插件设置里打开「启用内置法典词库」后再使用。"
+            )
+            return
+        raw = str(event.message_str or "").strip()
+        for prefix in ("/法典", "法典", "/grimoire", "grimoire", "/查法典", "查法典"):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):].strip()
+                break
+        if not raw:
+            yield event.plain_result(
+                "📖 用法：/法典 <关键词>\n"
+                "已收录 19,663 条实测词条（NAI4.5 18,505 / NAI5 1,158），"
+                "生图时可用【法典:词条名】直接展开。"
+            )
+            return
+        hits = await asyncio.to_thread(
+            search_grimoire, raw, 6, self._active_model_ver()
+        )
+        if not hits:
+            yield event.plain_result(f"未在法典中找到包含「{raw}」的词条。")
+            return
+        lines = [f"📖 NovelAI 法典检索：「{raw}」（前 {len(hits)} 条）"]
+        for i, h in enumerate(hits, 1):
+            lines.append(
+                f"\n{i}. 【{h['title']}】({h['volume']} · {h['category']})\n"
+                f"{h['clean_tags'][:260]}"
+            )
+        yield event.plain_result("\n".join(lines))
+

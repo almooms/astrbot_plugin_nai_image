@@ -155,10 +155,92 @@
         "min": 1,
         "max": 6
     },
+    "enable_artist_slots": {
+        "type": "bool",
+        "default": true,
+        "description": "启用画风槽位",
+        "hint": "开启后聊天生图使用「正式生图启用槽位」里那个槽位绑定的模型与画师串；槽位就是下面「画风槽位」里的每一行（画风名 / 适用模型 / 对应画师串），可自由增删改。关闭时忽略槽位，仍按下面的「默认风格」与「自定义画师串」出图。"
+    },
+    "artist_slots": {
+        "type": "template_list",
+        "default": [],
+        "description": "画风槽位",
+        "hint": "每一行就是一个画风：给它起个「画风名」、选它「适用模型」、贴上「对应画师串」。改完保存后，「正式生图启用槽位」下拉里显示的名字会同步变成你改后的画风名。",
+        "templates": {
+            "style": {
+                "name": "画风",
+                "items": {
+                    "name": {
+                        "type": "string",
+                        "default": "",
+                        "description": "画风名",
+                        "hint": "显示在「正式生图启用槽位」下拉里，可随时改名。"
+                    },
+                    "model": {
+                        "type": "string",
+                        "default": "nai-diffusion-4-5-full",
+                        "description": "适用模型",
+                        "options": [
+                            "nai-diffusion-4-5-full",
+                            "nai-diffusion-4-5-curated",
+                            "nai-diffusion-5-full",
+                            "nai-diffusion-5-curated",
+                            "nai-diffusion-4-full"
+                        ],
+                        "labels": [
+                            "NAI V4.5 Full",
+                            "NAI V4.5 Curated",
+                            "NAI V5 Full",
+                            "NAI V5 Curated",
+                            "NAI V4 Full"
+                        ]
+                    },
+                    "artists": {
+                        "type": "string",
+                        "default": "",
+                        "description": "对应画师串",
+                        "hint": "这个画风对应的画师串/风格提示词，会拼在提示词最前面。"
+                    }
+                }
+            }
+        },
+        "condition": {
+            "enable_artist_slots": true
+        }
+    },
+    "active_artist_slot": {
+        "type": "string",
+        "default": "1",
+        "description": "正式生图启用槽位",
+        "hint": "仅在「启用画风槽位」开启时生效。聊天生图固定使用该槽位绑定的模型与画师串；这里只填槽位编号，槽位的名称/模型/画师串在测试面板里增删改。填了不存在的编号时回退到第一个槽位。",
+        "condition": {
+            "enable_artist_slots": true
+        },
+        "options": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8"
+        ],
+        "labels": [
+            "1. 2.5D唯美风（萝）",
+            "2. 韩漫小清新风",
+            "3. 漫画同人风",
+            "4. 2.5D唯美风",
+            "5. 本子里番风",
+            "6. GalGame风",
+            "7. 自定义",
+            "8. 111"
+        ]
+    },
     "image_style": {
         "type": "string",
         "default": "vertical",
-        "description": "默认风格",
+        "description": "回退画风（槽位关闭时生效）",
         "options": [
             "vertical",
             "comicDoujin",
@@ -177,14 +259,18 @@
             "GalGame风",
             "自定义"
         ],
-        "hint": "选「自定义」时使用下方「自定义画师串」，其余风格使用内置画师串。旧配置里的 custom 与「自定义」等价。"
+        "hint": "仅当「启用画风槽位」关闭时使用：选「自定义」用下面的回退画师串，其余用内置画师串。开启槽位后画风由槽位决定，此项不参与，也不会显示在设置页。",
+        "condition": {
+            "enable_artist_slots": false
+        }
     },
     "custom_artists": {
         "type": "string",
         "default": "",
-        "description": "自定义画师串",
-        "hint": "仅在「默认风格」选择「自定义」时生效。",
+        "description": "回退画师串（槽位关闭时生效）",
+        "hint": "仅当「启用画风槽位」关闭、且回退画风选「自定义」时使用。",
         "condition": {
+            "enable_artist_slots": false,
             "image_style": "自定义"
         }
     },
@@ -303,7 +389,12 @@
         "default": [],
         "description": "精准参考兜底参考图",
         "hint": "参考图使用模式为「精准参考」时，若请求没有携带参考图（聊天指令、陪伴插件联动等场景），自动按顺序使用这里的全部图片作为精准参考（最多 8 张）；留空则照旧提示需要参考图。支持 png/jpg/webp。",
-        "file_types": ["png", "jpg", "jpeg", "webp"],
+        "file_types": [
+            "png",
+            "jpg",
+            "jpeg",
+            "webp"
+        ],
         "condition": {
             "call_mode": "openai"
         }
@@ -345,7 +436,7 @@
         "type": "string",
         "default": "关闭",
         "description": "提示词转译模式",
-        "hint": "「关闭」原样发送提示词；「开启」将整个提示词交给 LLM 转译；「自动」保留 NAI 标签，只提取自然语言片段转译后拼接。自动模式可用 |nl| 显式标记后续自然语言。旧版布尔值会在插件加载时自动迁移为「关闭」/「开启」并写回配置。模式同时作用于 /image 指令、本地代理与陪伴插件直连的生图请求；陪伴侧已输出原生 NAI 标签时请保持「关闭」。",
+        "hint": "「关闭」原样发送提示词，与转译相关的配置项（转译模型供应商 / 默认服装 / 服装缓存）会整块隐藏且完全不生效；「开启」将整个提示词交给 LLM 转译；「自动」保留 NAI 标签，只提取自然语言片段转译后拼接。自动模式可用 |nl| 显式标记后续自然语言。旧版布尔值会在插件加载时自动迁移为「关闭」/「开启」并写回配置。模式同时作用于 /image 指令、本地代理与陪伴插件直连的生图请求；陪伴侧已输出原生 NAI 标签时请保持「关闭」。",
         "options": [
             "关闭",
             "开启",
@@ -356,20 +447,29 @@
         "type": "string",
         "default": "",
         "description": "转译模型供应商",
-        "hint": "从 AstrBot 已配置的 provider 中选一个。留空时使用 AstrBot 的默认 provider。建议选择便宜/快速的小模型。",
-        "_special": "select_provider"
+        "hint": "从 AstrBot 已配置的 provider 中选一个。留空时使用 AstrBot 的默认 provider。建议选择便宜/快速的小模型。仅在提示词转译为「开启」或「自动」时显示并生效；转译关闭时本项被隐藏，也不会被任何请求使用。",
+        "_special": "select_provider",
+        "condition": {
+            "enable_translate": "开启"
+        }
     },
     "default_outfit": {
         "type": "string",
         "default": "",
         "description": "默认服装",
-        "hint": "在转译模式为「开启」，或「自动」识别到自然语言时生效；提示词没有具体服装且缓存为空时自动补全。使用英文逗号分隔 SD/NAI tag，例如：modern fashion, dark green knit dress, fitted sweater, slim pants, leather boots。"
+        "hint": "仅在提示词转译为「开启」或「自动」时显示并生效：提示词没有具体服装且缓存为空时自动补全。使用英文逗号分隔 SD/NAI tag，例如：modern fashion, dark green knit dress, fitted sweater, slim pants, leather boots。",
+        "condition": {
+            "enable_translate": "开启"
+        }
     },
     "enable_outfit_cache": {
         "type": "bool",
         "default": true,
         "description": "启用服装缓存池",
-        "hint": "开启后记录提示词中出现过的具体服装/换装描述，并在缓存时长内对模糊描述自动沿用；关闭后不写入也不读取缓存，本次提示词中的服装上下文与「默认服装」逻辑不受影响。"
+        "hint": "仅在提示词转译为「开启」或「自动」时显示并生效。开启后记录提示词中出现过的具体服装/换装描述，并在缓存时长内对模糊描述自动沿用；关闭后不写入也不读取缓存，本次提示词中的服装上下文与「默认服装」逻辑不受影响。",
+        "condition": {
+            "enable_translate": "开启"
+        }
     },
     "outfit_cache_ttl_seconds": {
         "type": "int",
@@ -379,7 +479,8 @@
         "min": 0,
         "max": 86400,
         "condition": {
-            "enable_outfit_cache": true
+            "enable_outfit_cache": true,
+            "enable_translate": "开启"
         }
     },
     "interrogate_provider": {
@@ -446,6 +547,21 @@
         "condition": {
             "enable_llm_tool": true
         }
+    },
+    "enable_character_blocks": {
+        "type": "bool",
+        "default": false,
+        "description": "启用多角色块",
+        "hint": "开启后 LLM 生图工具会多出「角色块1 / 角色块2」两个参数：场景写在 prompt，两个角色各自写自己的标签并分别放到画面左右，避免双人图串色。关闭时工具仍保持原来的单 prompt 参数，行为与升级前完全一致。",
+        "condition": {
+            "enable_llm_tool": true
+        }
+    },
+    "enable_grimoire": {
+        "type": "bool",
+        "default": false,
+        "description": "启用内置法典词库",
+        "hint": "开启后可用 /法典 指令与 NAI_Search_Grimoire 工具检索 19,663 条实测 Tag，并支持在提示词里写【法典:词条名】自动展开；开启提示词转译时会额外带上命中的实测词条作为参考。关闭时不做任何检索，提示词原样处理，行为与升级前完全一致。"
     },
     "enable_companion_link": {
         "type": "bool",

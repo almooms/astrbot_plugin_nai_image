@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>NAI 生图控制终端 // ENDFIELD PROTOCOL</title>
-  <link rel="stylesheet" href="./app.css?v=4.7.0" />
+  <link rel="stylesheet" href="./app.css?v=4.9.4" />
 </head>
 <body>
   <!-- 终末地等高线动态地形 Canvas + 底部工业网格 -->
@@ -644,10 +644,71 @@
             <div id="usageError" class="usage-empty hidden"></div>
           </div>
         </div>
+
+        <div class="card tactical-card acrylic-card">
+          <div class="card-header acrylic-header">
+            <div class="card-num-box">
+              <span class="card-number">06</span>
+              <span class="card-sec-tag">SLOT</span>
+            </div>
+            <div class="card-title-group">
+              <h2 class="card-title">画风槽位与法典 // SLOTS &amp; GRIMOIRE</h2>
+              <span class="card-sub-code">PRESET_SLOT_AND_TAG_LIBRARY</span>
+            </div>
+          </div>
+
+          <div class="card-body">
+            <div class="field">
+              <label class="field-label">画风槽位 // ARTIST SLOTS</label>
+              <div class="slot-head">
+                <span>画风名</span>
+                <span>适用模型</span>
+                <span>对应画师串</span>
+                <span></span>
+              </div>
+              <div id="slotRows" class="slot-rows"></div>
+              <div class="slot-actions">
+                <button id="btnSlotAdd" type="button" class="btn btn-secondary">
+                  <span class="btn-text-wrap"><span class="btn-main-text">＋ 新增槽位</span></span>
+                </button>
+                <button id="btnSlotSave" type="button" class="btn btn-primary">
+                  <span class="btn-text-wrap"><span class="btn-main-text">保存槽位</span></span>
+                </button>
+                <button id="btnSlotReset" type="button" class="btn btn-secondary">
+                  <span class="btn-text-wrap"><span class="btn-main-text">恢复内置画风</span></span>
+                </button>
+              </div>
+              <div class="field-hint" id="slotStatus">
+                每个槽位就是一个画风：起个「画风名」、选它适用的模型、贴上对应的画师串。
+                聊天生图使用插件设置里「正式生图启用槽位」选中的那一个。
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label">法典检索 // GRIMOIRE LOOKUP</label>
+              <div class="grimoire-search-row">
+                <input
+                  id="grimQuery"
+                  class="input acrylic-input"
+                  type="text"
+                  placeholder="中文关键词，如 死库水 / 旗袍 / 自拍 / 丝袜"
+                />
+                <button id="btnGrimSearch" type="button" class="btn btn-primary">
+                  <span class="btn-text-wrap"><span class="btn-main-text">检索</span></span>
+                </button>
+              </div>
+              <div id="grimResults" class="grimoire-results"></div>
+              <div class="field-hint">
+                需要在插件设置里打开「启用内置法典词库」才能检索；聊天里也可以直接用
+                <code>【法典:词条名】</code> 让生图自动展开成实测标签。
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
 
-  <script src="./app.js?v=4.8.1"></script>
+  <script src="./app.js?v=4.9.4"></script>
 </body>
 </html>

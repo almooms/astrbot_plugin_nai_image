@@ -139,7 +139,7 @@ def test_llm_tool_sends_image_and_returns_one_text_result():
     assert isinstance(event.sent_messages[0].chain[0], Image)
     assert len(event.sent_messages[0].chain) == 1
     assert event.sent_messages[0].chain[0].file.startswith("base64://")
-    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "方图")
+    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "方图", model=None, custom_artists=None)
 
 
 def test_llm_tool_passes_supported_sizes_to_api_unchanged():
@@ -162,7 +162,7 @@ def test_llm_tool_passes_supported_sizes_to_api_unchanged():
         )
 
         assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
-        plugin._generate_one.assert_awaited_once_with("1girl", "anime", size_cn)
+        plugin._generate_one.assert_awaited_once_with("1girl", "anime", size_cn, model=None, custom_artists=None)
 
 
 def test_llm_tool_openai_mode_uses_pixel_resolution():
@@ -217,7 +217,7 @@ def test_llm_tool_direct_mode_maps_pixel_size_to_tier():
     )
 
     assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
-    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "竖图")
+    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "竖图", model=None, custom_artists=None)
 
 
 def test_llm_tool_defaults_style_and_size_from_plugin_config():
@@ -229,7 +229,7 @@ def test_llm_tool_defaults_style_and_size_from_plugin_config():
     results = asyncio.run(collect_results(plugin.NAI_Generate_Image(event, "1girl")))
 
     assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
-    plugin._generate_one.assert_awaited_once_with("1girl", "galgame", "2K横图")
+    plugin._generate_one.assert_awaited_once_with("1girl", "galgame", "2K横图", model=None, custom_artists=None)
 
 
 def test_llm_tool_style_disabled_forces_plugin_default_style():
@@ -244,7 +244,7 @@ def test_llm_tool_style_disabled_forces_plugin_default_style():
     )
 
     assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
-    plugin._generate_one.assert_awaited_once_with("1girl", "galgame", "方图")
+    plugin._generate_one.assert_awaited_once_with("1girl", "galgame", "方图", model=None, custom_artists=None)
 
 
 def test_refresh_llm_tool_schema_hides_style_and_switches_size_format():
@@ -340,7 +340,7 @@ def test_llm_tool_blocks_concurrent_generation_in_same_event():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def delayed_generate(*args):
+    async def delayed_generate(*args, **kwargs):
         started.set()
         await release.wait()
         return b"test-image-bytes", "ok"
@@ -528,7 +528,7 @@ def test_llm_tool_returns_results_for_repeated_calls_but_generates_once():
         if message.role == "tool"
     ] == ["call_nai_image_1", "call_nai_image_2"]
     assert len(event.sent_messages) == 1
-    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "方图")
+    plugin._generate_one.assert_awaited_once_with("1girl", "anime", "方图", model=None, custom_artists=None)
 
 
 def test_llm_tool_returns_one_error_result():
@@ -543,3 +543,64 @@ def test_llm_tool_returns_one_error_result():
     assert isinstance(results[0], str)
     assert "生成失败" in results[0]
     assert "超时" in results[0]
+
+
+def test_llm_tool_uses_style_slot_model_and_artists():
+    """模型按画风名选槽位时，该槽位绑定的模型与画师串要一起生效。"""
+
+    plugin = make_plugin((b"test-image-bytes", "ok"))
+    plugin.enable_artist_slots = True
+    plugin._match_style_slot = lambda _name: {
+        "id": 1,
+        "name": "我的科幻风",
+        "model": "nai-diffusion-5-full",
+        "artists": "artist:slot",
+    }
+    event = FakeEvent()
+
+    results = asyncio.run(
+        collect_results(plugin.NAI_Generate_Image(event, "1girl", "我的科幻风", "方图"))
+    )
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    plugin._generate_one.assert_awaited_once_with(
+        "1girl",
+        "vertical",
+        "方图",
+        model="nai-diffusion-5-full",
+        custom_artists="artist:slot",
+    )
+
+
+def test_character_blocks_also_expand_grimoire_macros():
+    """角色块里的【法典:词条】也要展开——不能只处理主 prompt。"""
+
+    plugin = make_plugin((b"test-image-bytes", "ok"))
+    plugin.enable_character_blocks = True
+    seen: list[str] = []
+
+    def fake_expand(text):
+        seen.append(text)
+        return f"{text} => expanded" if text else text
+
+    plugin._expand_grimoire = fake_expand
+    event = FakeEvent()
+
+    results = asyncio.run(
+        collect_results(
+            plugin.NAI_Generate_Image(
+                event,
+                "1girl, classroom",
+                "",
+                "方图",
+                "【法典:女仆装】, smile",
+                "1boy",
+            )
+        )
+    )
+
+    assert results == ["图片已生成并发送给用户，请根据本次请求继续回复。"]
+    assert "【法典:女仆装】, smile" in seen
+    prompt_arg = plugin._generate_one.await_args.args[0]
+    assert "{人物 [【法典:女仆装】, smile => expanded], {位置左} 人物}" in prompt_arg
+    assert "{人物 [1boy => expanded], {位置右} 人物}" in prompt_arg

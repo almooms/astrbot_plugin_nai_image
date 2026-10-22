@@ -21,7 +21,10 @@ Thumbs.db
 desktop.ini
 
 # AstrBot plugin data (运行时生成)
-data/
+# 必须写 data/* 而不是 data/：父目录被整体忽略后，下面的反选规则会失效，
+# 更新词库时 git add -A 会静默漏掉 data/grimoire.db.gz。
+data/*
+!data/grimoire.db.gz
 *.log
 
 # Trial key encryption temp
